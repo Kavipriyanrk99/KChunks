@@ -33,6 +33,7 @@ kotlin {
     sourceSets {
         commonMain.dependencies {
             //put your multiplatform dependencies here
+            implementation(libs.kotlin.coroutine)
             implementation(libs.ktor.client.core)
             implementation(libs.okio)
         }

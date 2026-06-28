@@ -6,8 +6,10 @@ android-compileSdk = "36"
 vanniktechMavenPublish = "0.36.0"
 ktor = "3.5.0"
 okio = "3.16.2"
+koltin-coroutine = "1.11.0"
 
 [libraries]
+kotlin-coroutine = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "koltin-coroutine"}
 kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
 ktor-client-core = { module = "io.ktor:ktor-client-core", version.ref = "ktor" }
 ktor-client-okhttp = { module = "io.ktor:ktor-client-okhttp", version.ref = "ktor" }

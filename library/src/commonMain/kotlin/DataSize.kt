@@ -16,4 +16,6 @@ class DataSize(val bytes: Long) {
     fun lessThan(other: DataSize) = this.bytes < other.bytes
     fun greaterThan(other: DataSize) = this.bytes > other.bytes
     fun greaterThanOrEqualTo(other: DataSize) = this.bytes >= other.bytes
+
+    override fun toString(): String = bytes.toString()
 }

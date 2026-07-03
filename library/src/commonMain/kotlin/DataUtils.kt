@@ -16,6 +16,7 @@ object DataUtils {
     }
 
     fun calculateDownloadETA(totalSize: DataSize, downloadedDataSize: DataSize, speed: Double): Double {
+        if(speed <= 0.0) return 0.0
         val remDownloadSize = totalSize.bytes - downloadedDataSize.bytes
         return remDownloadSize / speed
     }

@@ -1,32 +1,26 @@
 import DataSize.Companion.bytes
 import DataSize.Companion.kibibytes
-import DataSize.Companion.mebibytes
-import io.ktor.client.HttpClient
-import io.ktor.client.call.body
-import io.ktor.client.plugins.HttpTimeout
-import io.ktor.client.plugins.HttpTimeoutConfig
-import io.ktor.client.request.get
-import io.ktor.client.request.head
-import io.ktor.client.request.prepareGet
-import io.ktor.client.statement.HttpResponse
-import io.ktor.client.statement.bodyAsBytes
-import io.ktor.http.HttpStatusCode
-import io.ktor.http.contentLength
-import io.ktor.http.isSuccess
-import io.ktor.utils.io.ByteReadChannel
-import io.ktor.utils.io.core.remaining
-import io.ktor.utils.io.exhausted
-import io.ktor.utils.io.readRemaining
+import io.ktor.client.*
+import io.ktor.client.call.*
+import io.ktor.client.plugins.*
+import io.ktor.client.request.*
+import io.ktor.client.statement.*
+import io.ktor.http.*
+import io.ktor.utils.io.*
+import io.ktor.utils.io.core.*
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
+import kotlinx.io.Source
 import kotlinx.io.buffered
 import kotlinx.io.readByteArray
 import okio.FileSystem
 import okio.Path
 import okio.SYSTEM
+import kotlin.time.measureTime
 
 class KChunks(private val url: String, private val path: Path) {
     private val httpClient by lazy {
@@ -42,6 +36,11 @@ class KChunks(private val url: String, private val path: Path) {
     private var job: Job? = null
     var contentLength: DataSize? = null
         private set
+
+    private val _downloadState = MutableStateFlow<DownloadState>(DownloadState.Unknown)
+    val downloadState = _downloadState.asStateFlow()
+
+    private val downloadSamples = ArrayDeque<DownloadSample>(10)
 
     private fun closeHttpClient() = httpClient.close()
 
@@ -67,49 +66,57 @@ class KChunks(private val url: String, private val path: Path) {
 
         contentLength = response.contentLength()?.bytes
 
+        _downloadState.value = DownloadState.Started
         val channel: ByteReadChannel = response.body()
         var readBytes = 0L
+        var prevReadBytes = 0L
 
         FileSystem.SYSTEM.write(path) {
             while (!channel.exhausted()) {
-                val chunk = channel.readRemaining(bufferSize.toLong())
-                readBytes += chunk.remaining
-                this.write(chunk.buffered().readByteArray())
-                println("Received $readBytes bytes from ${contentLength?.toLong() ?: "UNKNOWN"}")
+                lateinit var chunk: Source
+                val duration = measureTime {
+                    chunk = channel.readRemaining(bufferSize.bytes)
+                    prevReadBytes = readBytes
+                    readBytes += chunk.remaining
+                    this.write(chunk.buffered().readByteArray())
+                }
+
+                if(downloadSamples.size == 10) {
+                    downloadSamples.removeFirst()
+                }
+                downloadSamples.add(DownloadSample((readBytes - prevReadBytes).bytes, duration))
+
+                val downloadSpeed = DataUtils.calculateDownloadSpeed(downloadSamples)
+                val downloadETA = if(contentLength == null) Double.POSITIVE_INFINITY
+                    else DataUtils.calculateDownloadETA(contentLength!!, readBytes.bytes, downloadSpeed)
+                val downloadPercentage = if(contentLength == null) Double.NaN
+                    else DataUtils.calculateDownloadPercentage(contentLength!!, readBytes.bytes)
+
+                _downloadState.value = DownloadState.Downloading(
+                    speed = downloadSpeed,
+                    eta = downloadETA,
+                    percentage = downloadPercentage
+                )
+
+                println("Received $readBytes bytes from ${contentLength?.bytes ?: "UNKNOWN"} | Progress: $downloadSpeed bytes/sec, $downloadETA ETA in sec, ${downloadPercentage}%")
             }
         }
-    }
 
-
-    private suspend fun directDownload() {
-        val res = httpClient.get(url)
-        if (res.isSuccessful().not()) {
-            return
-        }
-
-        FileSystem.SYSTEM.write(path) {
-            val bodyAsBytes = res.bodyAsBytes()
-            this.write(bodyAsBytes)
-            println("Received ${bodyAsBytes.size} bytes from ${contentLength?.toLong() ?: "UNKNOWN"}")
-        }
+        _downloadState.value = DownloadState.Done
     }
 
     suspend fun download() = coroutineScope {
         job = launch {
             headRequest()
-
-            when {
-                contentLength == null
-                        || contentLength!!.greaterThan(bufferSize) -> streamingDownload()
-
-                else -> directDownload()
-            }
+            streamingDownload()
             closeHttpClient()
         }
     }
 
     suspend fun cancel() {
-        job?.cancelAndJoin()
+        _downloadState.value = DownloadState.Failed
+        if(job != null && job!!.isActive)
+            job!!.cancelAndJoin()
         closeHttpClient()
     }
 }

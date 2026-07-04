@@ -32,10 +32,10 @@ class KChunks(private val url: String, private val path: Path) {
             }
         }
     }
-    private val bufferSize = 8L.kibibytes
+    private val bufferSize = 16L.kibibytes
     private var job: Job? = null
-    var contentLength: DataSize? = null
-        private set
+    private var contentDisposition: String? = null
+    lateinit var fileName: String
 
     private val _downloadState = MutableStateFlow<DownloadState>(DownloadState.Unknown)
     val downloadState = _downloadState.asStateFlow()
@@ -43,13 +43,6 @@ class KChunks(private val url: String, private val path: Path) {
     private val downloadSamples = ArrayDeque<DownloadSample>(10)
 
     private fun closeHttpClient() = httpClient.close()
-
-    private suspend fun headRequest() {
-        val res = httpClient.head(url)
-
-        if (res.status == HttpStatusCode.OK)
-            contentLength = res.contentLength()?.bytes
-    }
 
     private fun HttpResponse.isSuccessful() = when {
         this.status.isSuccess() -> true
@@ -59,19 +52,40 @@ class KChunks(private val url: String, private val path: Path) {
         }
     }
 
+    private fun prepareFileName() {
+        if(this::fileName.isInitialized)
+            return
+
+        var preparedFileName = ""
+        contentDisposition?.let {
+            preparedFileName = HttpUtils.prepareFileNameFromURL(it)
+        }
+
+        if(preparedFileName.isBlank())
+            preparedFileName = HttpUtils.prepareFileNameFromURL(url)
+
+        if(preparedFileName.isBlank())
+            preparedFileName = IOUtils.prepareDefaultFileName()
+
+        this.fileName = preparedFileName
+    }
+
     private suspend fun streamingDownload() = httpClient.prepareGet(url).execute { response ->
         if (response.isSuccessful().not()) {
             return@execute
         }
 
-        contentLength = response.contentLength()?.bytes
+        val contentLength = response.contentLength()?.bytes
+        this@KChunks.contentDisposition = response.headers["Content-Disposition"]
+        prepareFileName()
 
         _downloadState.value = DownloadState.Started
         val channel: ByteReadChannel = response.body()
         var readBytes = 0L
         var prevReadBytes = 0L
 
-        FileSystem.SYSTEM.write(path) {
+        val filePath = path.resolve(fileName)
+        FileSystem.SYSTEM.write(filePath) {
             while (!channel.exhausted()) {
                 lateinit var chunk: Source
                 val duration = measureTime {
@@ -107,7 +121,16 @@ class KChunks(private val url: String, private val path: Path) {
 
     suspend fun download() = coroutineScope {
         job = launch {
-            headRequest()
+            streamingDownload()
+            closeHttpClient()
+        }
+    }
+
+    suspend fun download(fileName: String) = coroutineScope {
+        require(fileName.isNotBlank()) { "Custom filename can't be empty" }
+        this@KChunks.fileName = fileName
+
+        job = launch {
             streamingDownload()
             closeHttpClient()
         }

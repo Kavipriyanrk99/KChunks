@@ -7,6 +7,7 @@ object HttpUtils {
     private const val DOUBLE_QUOTES_DELIMITER = '"'
     private const val SINGLE_QUOTES_DELIMITER = '\''
     private const val CONTENT_DISPOSITION_ATTACHMENT = "attachment"
+    private const val CONTENT_DISPOSITION_INLINE = "inline"
     private const val CONTENT_DISPOSITION_FILENAME_PARAM1 = "filename*="
     private const val CONTENT_DISPOSITION_FILENAME_PARAM2 = "filename="
 
@@ -66,6 +67,7 @@ object HttpUtils {
             if (part.startsWith(CONTENT_DISPOSITION_FILENAME_PARAM1, true).not()
                 && part.startsWith(CONTENT_DISPOSITION_FILENAME_PARAM2, true).not()
                 && part.startsWith(CONTENT_DISPOSITION_ATTACHMENT, true).not()
+                && part.startsWith(CONTENT_DISPOSITION_INLINE, true).not()
             ) {
                 var merged = part
                 if (newParts.isNotEmpty()
@@ -122,7 +124,9 @@ object HttpUtils {
     }
 
     fun prepareFileNameFromURL(url: String): String {
-
-        return ""
+        val fileName = Url(url)
+            .segments
+            .last()
+        return fileName
     }
 }

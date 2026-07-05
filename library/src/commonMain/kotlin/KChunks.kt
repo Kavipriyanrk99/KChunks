@@ -6,6 +6,7 @@ import io.ktor.client.plugins.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
+import io.ktor.util.reflect.instanceOf
 import io.ktor.utils.io.*
 import io.ktor.utils.io.core.*
 import kotlinx.coroutines.Job
@@ -20,6 +21,8 @@ import kotlinx.io.readByteArray
 import okio.FileSystem
 import okio.Path
 import okio.SYSTEM
+import okio.buffer
+import okio.use
 import kotlin.time.measureTime
 
 class KChunks(private val url: String, private val path: Path) {
@@ -34,8 +37,13 @@ class KChunks(private val url: String, private val path: Path) {
     }
     private val bufferSize = 16L.kibibytes
     private var job: Job? = null
+    private var contentLength: DataSize? = null
     private var contentDisposition: String? = null
+    var allowRangeRequests = false
+    var etag: String? = null
+    var lastModified: String? = null
     lateinit var fileName: String
+        private set
 
     private val _downloadState = MutableStateFlow<DownloadState>(DownloadState.Unknown)
     val downloadState = _downloadState.asStateFlow()
@@ -70,13 +78,26 @@ class KChunks(private val url: String, private val path: Path) {
         this.fileName = preparedFileName
     }
 
-    private suspend fun streamingDownload() = httpClient.prepareGet(url).execute { response ->
+    private fun prepareHeaderBasedProperties(headers: Headers) {
+        this.contentLength = headers["Content-Length"]?.toLongOrNull()?.bytes
+        this.contentDisposition = headers["Content-Disposition"]
+        headers["Accept-Ranges"]?.let {
+            if(it == "bytes")
+                this.allowRangeRequests = true
+        }
+        this.etag = headers["ETag"]
+        this.lastModified = headers["Last-Modified"]
+    }
+
+    private suspend fun streamingDownload(customHeaders: Headers = Headers.Empty) = httpClient.prepareGet(url) {
+        if(customHeaders !== Headers.Empty)
+            this.headers.appendAll(customHeaders)
+    }.execute { response ->
         if (response.isSuccessful().not()) {
             return@execute
         }
 
-        val contentLength = response.contentLength()?.bytes
-        this@KChunks.contentDisposition = response.headers["Content-Disposition"]
+        prepareHeaderBasedProperties(response.headers)
         prepareFileName()
 
         _downloadState.value = DownloadState.Started
@@ -85,14 +106,20 @@ class KChunks(private val url: String, private val path: Path) {
         var prevReadBytes = 0L
 
         val filePath = path.resolve(fileName)
-        FileSystem.SYSTEM.write(filePath) {
+        val bufferedTargetFileSink = if(response.status == HttpStatusCode.PartialContent) {
+            FileSystem.SYSTEM.appendingSink(filePath, true).buffer()
+        } else {
+            FileSystem.SYSTEM.sink(filePath).buffer()
+        }
+
+        bufferedTargetFileSink.use {
             while (!channel.exhausted()) {
                 lateinit var chunk: Source
                 val duration = measureTime {
                     chunk = channel.readRemaining(bufferSize.bytes)
                     prevReadBytes = readBytes
                     readBytes += chunk.remaining
-                    this.write(chunk.buffered().readByteArray())
+                    it.write(chunk.buffered().readByteArray())
                 }
 
                 if(downloadSamples.size == 10) {
@@ -101,10 +128,10 @@ class KChunks(private val url: String, private val path: Path) {
                 downloadSamples.add(DownloadSample((readBytes - prevReadBytes).bytes, duration))
 
                 val downloadSpeed = DataUtils.calculateDownloadSpeed(downloadSamples)
-                val downloadETA = if(contentLength == null) Double.POSITIVE_INFINITY
-                    else DataUtils.calculateDownloadETA(contentLength!!, readBytes.bytes, downloadSpeed)
-                val downloadPercentage = if(contentLength == null) Double.NaN
-                    else DataUtils.calculateDownloadPercentage(contentLength!!, readBytes.bytes)
+                val downloadETA = if(this@KChunks.contentLength == null) Double.POSITIVE_INFINITY
+                    else DataUtils.calculateDownloadETA(this@KChunks.contentLength!!, readBytes.bytes, downloadSpeed)
+                val downloadPercentage = if(this@KChunks.contentLength == null) Double.NaN
+                    else DataUtils.calculateDownloadPercentage(this@KChunks.contentLength!!, readBytes.bytes)
 
                 _downloadState.value = DownloadState.Downloading(
                     speed = downloadSpeed,
@@ -112,7 +139,7 @@ class KChunks(private val url: String, private val path: Path) {
                     percentage = downloadPercentage
                 )
 
-                println("Received $readBytes bytes from ${contentLength?.bytes ?: "UNKNOWN"} | Progress: $downloadSpeed bytes/sec, $downloadETA ETA in sec, ${downloadPercentage}%")
+                println("Received $readBytes bytes from ${this@KChunks.contentLength?.bytes ?: "UNKNOWN"} | Progress: $downloadSpeed bytes/sec, $downloadETA ETA in sec, ${downloadPercentage}%")
             }
         }
 
@@ -132,6 +159,40 @@ class KChunks(private val url: String, private val path: Path) {
 
         job = launch {
             streamingDownload()
+            closeHttpClient()
+        }
+    }
+
+    suspend fun pause() {
+        if(this.allowRangeRequests.not())
+            error("Unsupported operation 'pause' as range-requests is not allowed for the download")
+
+        _downloadState.value = DownloadState.Paused
+        if(job != null && job!!.isActive)
+            job!!.cancelAndJoin()
+//        closeHttpClient()
+    }
+
+    suspend fun resume(fileName: String = "", etagOrLastModified: String) = coroutineScope {
+        require(etagOrLastModified.isNotBlank()) { "Download resuming failed. Resuming a download requires Etag or Last-Modified header value for resource integrity" }
+
+        if(fileName.isNotBlank())
+            this@KChunks.fileName = fileName
+
+        require(this@KChunks::fileName.isInitialized) { "No filename found to resume download" }
+
+        val filePath = path.resolve(this@KChunks.fileName)
+        val fileSizeInBytes = IOUtils.findFileSizeInBytes(filePath)
+        checkNotNull(fileSizeInBytes) { "Download resuming failed. Unable to determine the filesize of ${filePath.name}" }
+
+        val range = "bytes=${fileSizeInBytes}-"
+        val rangeRequestHeaders = Headers.build {
+            append("If-Match", etagOrLastModified)
+            append("Range", range)
+        }
+
+        job = launch {
+            streamingDownload(rangeRequestHeaders)
             closeHttpClient()
         }
     }

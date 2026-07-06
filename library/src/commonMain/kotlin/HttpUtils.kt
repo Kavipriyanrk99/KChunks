@@ -1,5 +1,7 @@
+import DataSize.Companion.mebibytes
 import io.ktor.http.*
 import io.ktor.utils.io.charsets.*
+import kotlin.math.ceil
 
 object HttpUtils {
     private const val CONTENT_DISPOSITION_DELIMITER = ';'
@@ -128,5 +130,30 @@ object HttpUtils {
             .segments
             .last()
         return fileName
+    }
+
+    fun prepareChunks(fileSize: DataSize, noOfChunks: Int = 16, minChunkSize: DataSize = 2L.mebibytes): MutableMap<Int, Pair<Long, Long>> {
+        var finalNoOfChunks = noOfChunks
+        while(ceil(fileSize.bytes.toDouble() / finalNoOfChunks) < minChunkSize.bytes && finalNoOfChunks > 1)
+            finalNoOfChunks -= 1
+
+        val evenChunkSize = fileSize.bytes / finalNoOfChunks
+        val oddChunkSize = evenChunkSize + (fileSize.bytes % finalNoOfChunks)
+        var start = 0L
+        var end: Long
+        val chunks = mutableMapOf<Int, Pair<Long, Long>>()
+        for(i in 1..finalNoOfChunks) {
+            if (i == finalNoOfChunks) {
+                end = start + oddChunkSize
+                chunks[i] = Pair(start, end)
+                continue
+            }
+
+            end = start + evenChunkSize
+            chunks[i] = Pair(start, end)
+            start = end
+        }
+
+        return chunks
     }
 }

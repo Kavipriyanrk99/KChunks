@@ -132,7 +132,7 @@ object HttpUtils {
         return fileName
     }
 
-    fun prepareChunks(fileSize: DataSize, noOfChunks: Int = 16, minChunkSize: DataSize = 2L.mebibytes): MutableMap<Int, Pair<Long, Long>> {
+    fun prepareChunks(fileSize: DataSize, noOfChunks: Int = 16, minChunkSize: DataSize = 2L.mebibytes): MutableMap<String, Pair<Long, Long>> {
         var finalNoOfChunks = noOfChunks
         while(ceil(fileSize.bytes.toDouble() / finalNoOfChunks) < minChunkSize.bytes && finalNoOfChunks > 1)
             finalNoOfChunks -= 1
@@ -141,16 +141,17 @@ object HttpUtils {
         val oddChunkSize = evenChunkSize + (fileSize.bytes % finalNoOfChunks)
         var start = 0L
         var end: Long
-        val chunks = mutableMapOf<Int, Pair<Long, Long>>()
+        val chunks = mutableMapOf<String, Pair<Long, Long>>()
         for(i in 1..finalNoOfChunks) {
+            val key = "chunk-$i"
             if (i == finalNoOfChunks) {
                 end = start + oddChunkSize
-                chunks[i] = Pair(start, end)
+                chunks[key] = Pair(start, end)
                 continue
             }
 
             end = start + evenChunkSize
-            chunks[i] = Pair(start, end)
+            chunks[key] = Pair(start, end)
             start = end
         }
 

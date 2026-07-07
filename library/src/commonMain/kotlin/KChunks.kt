@@ -6,15 +6,23 @@ import io.ktor.client.plugins.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
-import io.ktor.util.reflect.instanceOf
 import io.ktor.utils.io.*
 import io.ktor.utils.io.core.*
+import kotlinx.coroutines.CoroutineName
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.IO
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.io.Source
 import kotlinx.io.buffered
 import kotlinx.io.readByteArray
@@ -23,6 +31,8 @@ import okio.Path
 import okio.SYSTEM
 import okio.buffer
 import okio.use
+import kotlin.let
+import kotlin.time.Duration.Companion.seconds
 import kotlin.time.measureTime
 
 class KChunks(private val url: String, private val path: Path) {
@@ -50,6 +60,13 @@ class KChunks(private val url: String, private val path: Path) {
 
     private val downloadSamples = ArrayDeque<DownloadSample>(10)
 
+    private lateinit var chunks: MutableMap<String, Pair<Long, Long>>
+    private val tempChunks: MutableMap<String, Pair<Long, Long>> = mutableMapOf()
+    private val jobCoroutineNameMap: MutableMap<Job, String> = mutableMapOf()
+
+    private val _downloadStateMultipart = MutableStateFlow<MutableMap<Job, DownloadState>>(mutableMapOf())
+    val downloadStateMultipart = _downloadStateMultipart.asStateFlow()
+
     private fun closeHttpClient() = httpClient.close()
 
     private fun HttpResponse.isSuccessful() = when {
@@ -61,7 +78,7 @@ class KChunks(private val url: String, private val path: Path) {
     }
 
     private fun prepareFileName() {
-        if(this::fileName.isInitialized)
+        if (this::fileName.isInitialized)
             return
 
         var preparedFileName = ""
@@ -69,20 +86,26 @@ class KChunks(private val url: String, private val path: Path) {
             preparedFileName = HttpUtils.prepareFileNameFromURL(it)
         }
 
-        if(preparedFileName.isBlank())
+        if (preparedFileName.isBlank())
             preparedFileName = HttpUtils.prepareFileNameFromURL(url)
 
-        if(preparedFileName.isBlank())
+        if (preparedFileName.isBlank())
             preparedFileName = IOUtils.prepareDefaultFileName()
 
         this.fileName = preparedFileName
     }
 
-    private fun prepareHeaderBasedProperties(headers: Headers) {
+    private suspend fun initializeHeaderBasedProperties() {
+        val headers = httpClient.prepareGet(url) {
+            this.headers.append("Range", "bytes=0-0")
+        }.execute {
+            it.headers
+        }
+
         this.contentLength = headers["Content-Length"]?.toLongOrNull()?.bytes
         this.contentDisposition = headers["Content-Disposition"]
         headers["Accept-Ranges"]?.let {
-            if(it == "bytes")
+            if (it == "bytes")
                 this.allowRangeRequests = true
         }
         this.etag = headers["ETag"]
@@ -90,14 +113,14 @@ class KChunks(private val url: String, private val path: Path) {
     }
 
     private suspend fun streamingDownload(customHeaders: Headers = Headers.Empty) = httpClient.prepareGet(url) {
-        if(customHeaders !== Headers.Empty)
+        if (customHeaders !== Headers.Empty)
             this.headers.appendAll(customHeaders)
     }.execute { response ->
         if (response.isSuccessful().not()) {
             return@execute
         }
 
-        prepareHeaderBasedProperties(response.headers)
+        initializeHeaderBasedProperties()
         prepareFileName()
 
         _downloadState.value = DownloadState.Started
@@ -106,7 +129,7 @@ class KChunks(private val url: String, private val path: Path) {
         var prevReadBytes = 0L
 
         val filePath = path.resolve(fileName)
-        val bufferedTargetFileSink = if(response.status == HttpStatusCode.PartialContent) {
+        val bufferedTargetFileSink = if (response.status == HttpStatusCode.PartialContent) {
             FileSystem.SYSTEM.appendingSink(filePath, true).buffer()
         } else {
             FileSystem.SYSTEM.sink(filePath).buffer()
@@ -122,16 +145,16 @@ class KChunks(private val url: String, private val path: Path) {
                     it.write(chunk.buffered().readByteArray())
                 }
 
-                if(downloadSamples.size == 10) {
+                if (downloadSamples.size == 10) {
                     downloadSamples.removeFirst()
                 }
                 downloadSamples.add(DownloadSample((readBytes - prevReadBytes).bytes, duration))
 
                 val downloadSpeed = DataUtils.calculateDownloadSpeed(downloadSamples)
-                val downloadETA = if(this@KChunks.contentLength == null) Double.POSITIVE_INFINITY
-                    else DataUtils.calculateDownloadETA(this@KChunks.contentLength!!, readBytes.bytes, downloadSpeed)
-                val downloadPercentage = if(this@KChunks.contentLength == null) Double.NaN
-                    else DataUtils.calculateDownloadPercentage(this@KChunks.contentLength!!, readBytes.bytes)
+                val downloadETA = if (this@KChunks.contentLength == null) Double.POSITIVE_INFINITY
+                else DataUtils.calculateDownloadETA(this@KChunks.contentLength!!, readBytes.bytes, downloadSpeed)
+                val downloadPercentage = if (this@KChunks.contentLength == null) Double.NaN
+                else DataUtils.calculateDownloadPercentage(this@KChunks.contentLength!!, readBytes.bytes)
 
                 _downloadState.value = DownloadState.Downloading(
                     speed = downloadSpeed,
@@ -164,11 +187,11 @@ class KChunks(private val url: String, private val path: Path) {
     }
 
     suspend fun pause() {
-        if(this.allowRangeRequests.not())
+        if (this.allowRangeRequests.not())
             error("Unsupported operation 'pause' as range-requests is not allowed for the download")
 
         _downloadState.value = DownloadState.Paused
-        if(job != null && job!!.isActive)
+        if (job != null && job!!.isActive)
             job!!.cancelAndJoin()
 //        closeHttpClient()
     }
@@ -176,7 +199,7 @@ class KChunks(private val url: String, private val path: Path) {
     suspend fun resume(fileName: String = "", etagOrLastModified: String) = coroutineScope {
         require(etagOrLastModified.isNotBlank()) { "Download resuming failed. Resuming a download requires Etag or Last-Modified header value for resource integrity" }
 
-        if(fileName.isNotBlank())
+        if (fileName.isNotBlank())
             this@KChunks.fileName = fileName
 
         require(this@KChunks::fileName.isInitialized) { "No filename found to resume download" }
@@ -197,9 +220,129 @@ class KChunks(private val url: String, private val path: Path) {
         }
     }
 
+    private suspend fun awaitChunksInDownloading() = _downloadStateMultipart.first { map ->
+        map.isNotEmpty() && map.values.all { it is DownloadState.Downloading }
+    }
+
+
+    private fun calculateCurrentThroughput(): Double = _downloadStateMultipart.value.values.sumOf {
+        (it as? DownloadState.Downloading)?.percentage ?: 0.0
+    }
+
+    private suspend fun CoroutineScope.launchWorkers(count: Int = 1) = repeat(count) {
+        val coroutineName = chunks.keys.first()
+        chunks.remove(coroutineName)?.let { bytePair ->
+            tempChunks[coroutineName] = bytePair
+            val range = "bytes=${bytePair.first}-${bytePair.second}"
+            val customHeaders = Headers.build {
+                append("If-Match", this@KChunks.etag ?: "")
+                append("Range", range)
+            }
+
+            launch(CoroutineName(coroutineName)) {
+                streamingDownloadMultipart(customHeaders)
+            }.also { job ->
+                _downloadStateMultipart.update {
+                    it[job] = DownloadState.Unknown
+                    it
+                }
+                jobCoroutineNameMap[job] = coroutineName
+            }
+        }
+    }
+
+    private suspend fun CoroutineScope.killSlowWorkers(count: Int) = repeat(count) {
+        val slowState = _downloadStateMultipart.value.minByOrNull {
+            (it.value as? DownloadState.Downloading)?.percentage ?: 0.0
+        }
+
+        if (slowState != null) {
+            val coroutineName = jobCoroutineNameMap[slowState.key]
+            slowState.key.cancel()
+            _downloadStateMultipart.value.remove(slowState.key)
+            tempChunks.remove(coroutineName)?.let {
+                chunks[coroutineName!!] = it
+            }
+        }
+    }
+
+    suspend fun streamingDownloadMultipart(customHeaders: Headers = Headers.Empty) {
+
+    }
+
+    suspend fun multipartDownload(initialWorkers: Int = 4) = withContext(Dispatchers.IO) {
+        initializeHeaderBasedProperties()
+        require(allowRangeRequests) { "Server doesn't support range-request. Multi-part downloading is not possible" }
+        checkNotNull(contentLength) { "Multi-part download requires Content-Length" }
+        this@KChunks.chunks = HttpUtils.prepareChunks(contentLength!!)
+
+        var currentWorkers = initialWorkers
+        val totalChunks = chunks.size
+//        repeat(currentWorkers) {
+//            val key = chunks.keys.first()
+//            chunks.remove(key)?.let { pair ->
+//                tempChunks[key] = pair
+//                val range = "bytes=${pair.first}-${pair.second}"
+//                val customHeaders = Headers.build {
+//                    append("If-Match", this@KChunks.etag ?: "")
+//                    append("Range", range)
+//                }
+//                val job = launch {
+//                    streamingDownloadMultipart(customHeaders)
+//                }
+//                _downloadStateMultipart.update {
+//                    it[job] = DownloadState.Unknown
+//                    it
+//                }
+//            }
+//        }
+        launchWorkers(currentWorkers)
+
+        launch {
+            // waits till chunks in downloadState goes to DownloadState.Download
+            awaitChunksInDownloading()
+            var prevThroughput = calculateCurrentThroughput()
+            var currentThroughput = 0.0
+            while (tempChunks.size != totalChunks) {
+                delay(10.seconds)
+                currentThroughput = calculateCurrentThroughput()
+                if (currentThroughput - prevThroughput >= 15) {
+//                    launch {
+//                        streamingDownloadMultipart()
+//                    }.also { job ->
+//                        _downloadStateMultipart.update {
+//                            it[job] = DownloadState.Unknown
+//                            it
+//                        }
+//                    }
+                    launchWorkers()
+                } else {
+                    currentWorkers /= 2
+                    killSlowWorkers(currentWorkers)
+//                    repeat(currentWorkers) {
+//                        val slowState = _downloadStateMultipart.value.minByOrNull {
+//                            (it.value as? DownloadState.Downloading)?.percentage ?: 0.0
+//                        }
+//
+//                        if (slowState != null) {
+//                            val coroutineName = jobCoroutineNameMap[slowState.key]
+//                            slowState.key.cancel()
+//                            _downloadStateMultipart.value.remove(slowState.key)
+//                            tempChunks.remove(coroutineName)?.let {
+//                                chunks[coroutineName!!] = it
+//                            }
+//                        }
+//                    }
+                }
+
+                prevThroughput = currentThroughput
+            }
+        }
+    }
+
     suspend fun cancel() {
         _downloadState.value = DownloadState.Failed
-        if(job != null && job!!.isActive)
+        if (job != null && job!!.isActive)
             job!!.cancelAndJoin()
         closeHttpClient()
     }

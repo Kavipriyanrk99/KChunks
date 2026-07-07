@@ -13,7 +13,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -31,6 +30,7 @@ import okio.Path
 import okio.SYSTEM
 import okio.buffer
 import okio.use
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.let
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.measureTime
@@ -251,7 +251,7 @@ class KChunks(private val url: String, private val path: Path) {
         }
     }
 
-    private suspend fun CoroutineScope.killSlowWorkers(count: Int) = repeat(count) {
+    private fun killSlowWorkers(count: Int) = repeat(count) {
         val slowState = _downloadStateMultipart.value.minByOrNull {
             (it.value as? DownloadState.Downloading)?.percentage ?: 0.0
         }
@@ -266,8 +266,78 @@ class KChunks(private val url: String, private val path: Path) {
         }
     }
 
-    suspend fun streamingDownloadMultipart(customHeaders: Headers = Headers.Empty) {
+    suspend fun CoroutineScope.streamingDownloadMultipart(customHeaders: Headers = Headers.Empty) {
+        val chunkCoroutineJob = coroutineContext[Job]
+        val chunkCoroutineName = jobCoroutineNameMap[chunkCoroutineJob]
 
+        try {
+            httpClient.prepareGet(url) {
+                if (customHeaders !== Headers.Empty)
+                    this.headers.appendAll(customHeaders)
+            }.execute { response ->
+                if (response.isSuccessful().not() || response.status != HttpStatusCode.PartialContent) {
+                    error("Range-request failed")
+                }
+
+                val chunkFileName = "${this@KChunks.fileName}.${chunkCoroutineName}"
+                val chunkContentLength = response.headers["Content-Length"]?.toLongOrNull()?.bytes
+
+                _downloadStateMultipart.update {
+                    it[chunkCoroutineJob!!] = DownloadState.Started
+                    it
+                }
+                val channel: ByteReadChannel = response.body()
+                var readBytes = 0L
+                var prevReadBytes = 0L
+
+                val chunkFilePath = path.resolve(chunkFileName)
+                FileSystem.SYSTEM.write(chunkFilePath) {
+                    while (!channel.exhausted()) {
+                        lateinit var chunk: Source
+                        val duration = measureTime {
+                            chunk = channel.readRemaining(bufferSize.bytes)
+                            prevReadBytes = readBytes
+                            readBytes += chunk.remaining
+                            this.write(chunk.buffered().readByteArray())
+                        }
+
+                        if (downloadSamples.size == 10) {
+                            downloadSamples.removeFirst()
+                        }
+                        downloadSamples.add(DownloadSample((readBytes - prevReadBytes).bytes, duration))
+
+                        val downloadSpeed = DataUtils.calculateDownloadSpeed(downloadSamples)
+                        val downloadETA = if (chunkContentLength == null) Double.POSITIVE_INFINITY
+                        else DataUtils.calculateDownloadETA(chunkContentLength, readBytes.bytes, downloadSpeed)
+                        val downloadPercentage = if (chunkContentLength == null) Double.NaN
+                        else DataUtils.calculateDownloadPercentage(chunkContentLength, readBytes.bytes)
+
+                        _downloadStateMultipart.update {
+                            it[chunkCoroutineJob!!] = DownloadState.Downloading(
+                                speed = downloadSpeed,
+                                eta = downloadETA,
+                                percentage = downloadPercentage
+                            )
+                            it
+                        }
+
+                        println("Received $readBytes bytes from ${chunkContentLength?.bytes ?: "UNKNOWN"} | Progress: $downloadSpeed bytes/sec, $downloadETA ETA in sec, ${downloadPercentage}%")
+                    }
+                }
+            }
+        } catch (ce: CancellationException) {
+            throw CancellationException(ce)
+        } catch (e: Exception) {
+            _downloadStateMultipart.value.remove(chunkCoroutineJob)
+            tempChunks.remove(chunkCoroutineName)?.let {
+                chunks[chunkCoroutineName!!] = it
+            }
+        }
+
+        _downloadStateMultipart.update {
+            it[chunkCoroutineJob!!] = DownloadState.Done
+            it
+        }
     }
 
     suspend fun multipartDownload(initialWorkers: Int = 4) = withContext(Dispatchers.IO) {
@@ -278,24 +348,6 @@ class KChunks(private val url: String, private val path: Path) {
 
         var currentWorkers = initialWorkers
         val totalChunks = chunks.size
-//        repeat(currentWorkers) {
-//            val key = chunks.keys.first()
-//            chunks.remove(key)?.let { pair ->
-//                tempChunks[key] = pair
-//                val range = "bytes=${pair.first}-${pair.second}"
-//                val customHeaders = Headers.build {
-//                    append("If-Match", this@KChunks.etag ?: "")
-//                    append("Range", range)
-//                }
-//                val job = launch {
-//                    streamingDownloadMultipart(customHeaders)
-//                }
-//                _downloadStateMultipart.update {
-//                    it[job] = DownloadState.Unknown
-//                    it
-//                }
-//            }
-//        }
         launchWorkers(currentWorkers)
 
         launch {
@@ -307,32 +359,10 @@ class KChunks(private val url: String, private val path: Path) {
                 delay(10.seconds)
                 currentThroughput = calculateCurrentThroughput()
                 if (currentThroughput - prevThroughput >= 15) {
-//                    launch {
-//                        streamingDownloadMultipart()
-//                    }.also { job ->
-//                        _downloadStateMultipart.update {
-//                            it[job] = DownloadState.Unknown
-//                            it
-//                        }
-//                    }
                     launchWorkers()
                 } else {
                     currentWorkers /= 2
                     killSlowWorkers(currentWorkers)
-//                    repeat(currentWorkers) {
-//                        val slowState = _downloadStateMultipart.value.minByOrNull {
-//                            (it.value as? DownloadState.Downloading)?.percentage ?: 0.0
-//                        }
-//
-//                        if (slowState != null) {
-//                            val coroutineName = jobCoroutineNameMap[slowState.key]
-//                            slowState.key.cancel()
-//                            _downloadStateMultipart.value.remove(slowState.key)
-//                            tempChunks.remove(coroutineName)?.let {
-//                                chunks[coroutineName!!] = it
-//                            }
-//                        }
-//                    }
                 }
 
                 prevThroughput = currentThroughput

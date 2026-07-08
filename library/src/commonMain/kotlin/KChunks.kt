@@ -18,6 +18,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -32,6 +33,7 @@ import okio.buffer
 import okio.use
 import kotlin.coroutines.cancellation.CancellationException
 import kotlin.let
+import kotlin.math.log
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.measureTime
 
@@ -40,7 +42,7 @@ class KChunks(private val url: String, private val path: Path) {
         HttpClient {
             install(HttpTimeout) {
                 requestTimeoutMillis = HttpTimeoutConfig.INFINITE_TIMEOUT_MS
-                connectTimeoutMillis = 10_000
+                connectTimeoutMillis = 50_000
                 socketTimeoutMillis = 30_000
             }
         }
@@ -96,9 +98,7 @@ class KChunks(private val url: String, private val path: Path) {
     }
 
     private suspend fun initializeHeaderBasedProperties() {
-        val headers = httpClient.prepareGet(url) {
-            this.headers.append("Range", "bytes=0-0")
-        }.execute {
+        val headers = httpClient.prepareGet(url).execute {
             it.headers
         }
 
@@ -110,6 +110,9 @@ class KChunks(private val url: String, private val path: Path) {
         }
         this.etag = headers["ETag"]
         this.lastModified = headers["Last-Modified"]
+        prepareFileName()
+        IOUtils.log("Content-Length: ${this.contentLength}, Content-Disposition: ${this.contentDisposition}, " +
+                "Accept-Ranges: ${this.allowRangeRequests}, Etag: ${this.etag}, Last-Modified: ${this.lastModified}, filename: ${this.fileName}")
     }
 
     private suspend fun streamingDownload(customHeaders: Headers = Headers.Empty) = httpClient.prepareGet(url) {
@@ -230,9 +233,9 @@ class KChunks(private val url: String, private val path: Path) {
     }
 
     private suspend fun CoroutineScope.launchWorkers(count: Int = 1) = repeat(count) {
-        val coroutineName = chunks.keys.first()
+        val coroutineName = chunks.keys.firstOrNull()
         chunks.remove(coroutineName)?.let { bytePair ->
-            tempChunks[coroutineName] = bytePair
+            tempChunks[coroutineName!!] = bytePair
             val range = "bytes=${bytePair.first}-${bytePair.second}"
             val customHeaders = Headers.build {
                 append("If-Match", this@KChunks.etag ?: "")
@@ -242,9 +245,10 @@ class KChunks(private val url: String, private val path: Path) {
             launch(CoroutineName(coroutineName)) {
                 streamingDownloadMultipart(customHeaders)
             }.also { job ->
-                _downloadStateMultipart.update {
-                    it[job] = DownloadState.Unknown
-                    it
+                _downloadStateMultipart.update { old ->
+                    old.toMutableMap().apply {
+                        this[job] = DownloadState.Unknown
+                    }
                 }
                 jobCoroutineNameMap[job] = coroutineName
             }
@@ -259,16 +263,22 @@ class KChunks(private val url: String, private val path: Path) {
         if (slowState != null) {
             val coroutineName = jobCoroutineNameMap[slowState.key]
             slowState.key.cancel()
-            _downloadStateMultipart.value.remove(slowState.key)
+            _downloadStateMultipart.update { old ->
+                old.toMutableMap().apply {
+                    remove(slowState.key)
+                }
+            }
             tempChunks.remove(coroutineName)?.let {
                 chunks[coroutineName!!] = it
             }
+            IOUtils.log("Killing worker of chunk: $coroutineName")
         }
     }
 
     suspend fun CoroutineScope.streamingDownloadMultipart(customHeaders: Headers = Headers.Empty) {
         val chunkCoroutineJob = coroutineContext[Job]
         val chunkCoroutineName = jobCoroutineNameMap[chunkCoroutineJob]
+        IOUtils.log(coroutineContext, "streamingDownloadMultipart started for chunk: $chunkCoroutineName")
 
         try {
             httpClient.prepareGet(url) {
@@ -276,15 +286,18 @@ class KChunks(private val url: String, private val path: Path) {
                     this.headers.appendAll(customHeaders)
             }.execute { response ->
                 if (response.isSuccessful().not() || response.status != HttpStatusCode.PartialContent) {
+                    IOUtils.log(coroutineContext, "Range-request failed chunk: $chunkCoroutineName")
                     error("Range-request failed")
                 }
 
                 val chunkFileName = "${this@KChunks.fileName}.${chunkCoroutineName}"
                 val chunkContentLength = response.headers["Content-Length"]?.toLongOrNull()?.bytes
+                val chunkDownloadSample = ArrayDeque<DownloadSample>()
 
-                _downloadStateMultipart.update {
-                    it[chunkCoroutineJob!!] = DownloadState.Started
-                    it
+                _downloadStateMultipart.update { old ->
+                    old.toMutableMap().apply {
+                        this[chunkCoroutineJob!!] = DownloadState.Started
+                    }
                 }
                 val channel: ByteReadChannel = response.body()
                 var readBytes = 0L
@@ -301,42 +314,46 @@ class KChunks(private val url: String, private val path: Path) {
                             this.write(chunk.buffered().readByteArray())
                         }
 
-                        if (downloadSamples.size == 10) {
-                            downloadSamples.removeFirst()
+                        if (chunkDownloadSample.size == 10) {
+                            chunkDownloadSample.removeFirst()
                         }
-                        downloadSamples.add(DownloadSample((readBytes - prevReadBytes).bytes, duration))
+                        chunkDownloadSample.add(DownloadSample((readBytes - prevReadBytes).bytes, duration))
 
-                        val downloadSpeed = DataUtils.calculateDownloadSpeed(downloadSamples)
+                        val downloadSpeed = DataUtils.calculateDownloadSpeed(chunkDownloadSample)
                         val downloadETA = if (chunkContentLength == null) Double.POSITIVE_INFINITY
                         else DataUtils.calculateDownloadETA(chunkContentLength, readBytes.bytes, downloadSpeed)
                         val downloadPercentage = if (chunkContentLength == null) Double.NaN
                         else DataUtils.calculateDownloadPercentage(chunkContentLength, readBytes.bytes)
 
-                        _downloadStateMultipart.update {
-                            it[chunkCoroutineJob!!] = DownloadState.Downloading(
-                                speed = downloadSpeed,
-                                eta = downloadETA,
-                                percentage = downloadPercentage
-                            )
-                            it
+                        _downloadStateMultipart.update { old ->
+                            old.toMutableMap().apply {
+                                this[chunkCoroutineJob!!] = DownloadState.Downloading(
+                                    speed = downloadSpeed,
+                                    eta = downloadETA,
+                                    percentage = downloadPercentage
+                                )
+                            }
                         }
 
-                        println("Received $readBytes bytes from ${chunkContentLength?.bytes ?: "UNKNOWN"} | Progress: $downloadSpeed bytes/sec, $downloadETA ETA in sec, ${downloadPercentage}%")
+                        IOUtils.log(coroutineContext, "Chunk: $chunkCoroutineName, Received $readBytes bytes from ${chunkContentLength?.bytes ?: "UNKNOWN"} | Progress: $downloadSpeed bytes/sec, $downloadETA ETA in sec, ${downloadPercentage}%")
                     }
                 }
             }
         } catch (ce: CancellationException) {
-            throw CancellationException(ce)
+            IOUtils.log(coroutineContext, ce)
+            throw ce
         } catch (e: Exception) {
-            _downloadStateMultipart.value.remove(chunkCoroutineJob)
+            IOUtils.log(coroutineContext, e)
             tempChunks.remove(chunkCoroutineName)?.let {
                 chunks[chunkCoroutineName!!] = it
             }
-        }
-
-        _downloadStateMultipart.update {
-            it[chunkCoroutineJob!!] = DownloadState.Done
-            it
+            throw e
+        } finally {
+            _downloadStateMultipart.update { old ->
+                old.toMutableMap().apply {
+                    remove(chunkCoroutineJob)
+                }
+            }
         }
     }
 
@@ -348,6 +365,7 @@ class KChunks(private val url: String, private val path: Path) {
 
         var currentWorkers = initialWorkers
         val totalChunks = chunks.size
+        var optimalWorkers = initialWorkers
         launchWorkers(currentWorkers)
 
         launch {
@@ -358,14 +376,24 @@ class KChunks(private val url: String, private val path: Path) {
             while (tempChunks.size != totalChunks) {
                 delay(10.seconds)
                 currentThroughput = calculateCurrentThroughput()
-                if (currentThroughput - prevThroughput >= 15) {
-                    launchWorkers()
-                } else {
-                    currentWorkers /= 2
-                    killSlowWorkers(currentWorkers)
+                currentWorkers = _downloadStateMultipart.value.size
+                if(currentWorkers == 0)
+                    launchWorkers(optimalWorkers)
+                else {
+                    if (currentThroughput - prevThroughput >= 15) {
+                        launchWorkers()
+                    } else {
+                        currentWorkers /= 2
+                        killSlowWorkers(currentWorkers)
+                    }
+
+                    currentWorkers = _downloadStateMultipart.value.size
+                    if(currentWorkers != 0)
+                        optimalWorkers = currentWorkers
                 }
 
                 prevThroughput = currentThroughput
+                IOUtils.log("Optimal workers: $optimalWorkers, current workers: $currentWorkers")
             }
         }
     }

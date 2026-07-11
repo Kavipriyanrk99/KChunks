@@ -1,10 +1,10 @@
-package com.github.kavipriyanrk99
+package io.github.kavipriyanrk99.kchunks
 
 import okio.Path
 
 class KChunks(val url: String, val dirPath: Path) {
     init {
-        require(url.isBlank()) { "Download URL is blank" }
+        require(url.isNotBlank()) { "Download URL is blank" }
         require(FileService.validateDirPath(dirPath)) { "Directory path is not a directory" }
     }
 

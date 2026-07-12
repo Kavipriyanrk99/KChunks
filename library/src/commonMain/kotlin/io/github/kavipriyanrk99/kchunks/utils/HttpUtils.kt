@@ -1,9 +1,14 @@
-import DataSize.Companion.mebibytes
-import io.ktor.http.*
-import io.ktor.utils.io.charsets.*
-import kotlin.math.ceil
+package io.github.kavipriyanrk99.kchunks.utils
 
-object HttpUtils {
+import io.github.kavipriyanrk99.kchunks.Chunk
+import io.github.kavipriyanrk99.kchunks.DownloadState
+import io.ktor.http.Url
+import io.ktor.http.decodeURLPart
+import io.ktor.utils.io.charsets.Charsets
+import io.ktor.utils.io.charsets.isSupported
+import io.ktor.utils.io.charsets.name
+
+internal object HttpUtils {
     private const val CONTENT_DISPOSITION_DELIMITER = ';'
     private const val EQUAL_DELIMITER = '='
     private const val DOUBLE_QUOTES_DELIMITER = '"'
@@ -99,13 +104,14 @@ object HttpUtils {
                 val language = encoded.substring(firstQuoteIndex + 1, secondQuoteIndex)
                 val filename = encoded.substring(secondQuoteIndex + 1)
 
-                val charsetInstance = if(charset == Charsets.ISO_8859_1.name || charset == Charsets.ISO_8859_1.name.lowercase()) {
-                    Charsets.ISO_8859_1
-                } else {
-                    Charsets.UTF_8
-                }
+                val charsetInstance =
+                    if (charset == Charsets.ISO_8859_1.name || charset == Charsets.ISO_8859_1.name.lowercase()) {
+                        Charsets.ISO_8859_1
+                    } else {
+                        Charsets.UTF_8
+                    }
 
-                if(filename.isNotBlank() && charset.isNotBlank() && Charsets.isSupported(charsetInstance.name)) {
+                if (filename.isNotBlank() && charset.isNotBlank() && Charsets.isSupported(charsetInstance.name)) {
                     return filename.decodeURLPart(charset = charsetInstance)
                 }
             }
@@ -132,29 +138,8 @@ object HttpUtils {
         return fileName
     }
 
-    fun prepareChunks(fileSize: DataSize, noOfChunks: Int = 16, minChunkSize: DataSize = 2L.mebibytes): MutableMap<String, Pair<Long, Long>> {
-        var finalNoOfChunks = noOfChunks
-        while(ceil(fileSize.bytes.toDouble() / finalNoOfChunks) < minChunkSize.bytes && finalNoOfChunks > 1)
-            finalNoOfChunks -= 1
+    fun calculateCurrentThroughput(chunks: List<Chunk>): Double =
+        chunks.filter { it.state is DownloadState.Downloading }
+            .sumOf { it.speed ?: 0.0 }
 
-        val evenChunkSize = fileSize.bytes / finalNoOfChunks
-        val oddChunkSize = evenChunkSize + (fileSize.bytes % finalNoOfChunks)
-        var start = 0L
-        var end: Long
-        val chunks = mutableMapOf<String, Pair<Long, Long>>()
-        for(i in 1..finalNoOfChunks) {
-            val key = "chunk-$i"
-            if (i == finalNoOfChunks) {
-                end = start + oddChunkSize
-                chunks[key] = Pair(start, end)
-                continue
-            }
-
-            end = start + evenChunkSize
-            chunks[key] = Pair(start, end)
-            start = end
-        }
-
-        return chunks
-    }
 }

@@ -1,5 +1,6 @@
 package io.github.kavipriyanrk99.kchunks
 
+import io.github.kavipriyanrk99.kchunks.service.FileService
 import okio.Path
 
 class KChunks(val url: String, val dirPath: Path) {
@@ -9,7 +10,8 @@ class KChunks(val url: String, val dirPath: Path) {
     }
 
     suspend fun download() {
-        TODO()
+        val downloader = Downloader(url, dirPath)
+        downloader.multipartDownload()
     }
 
     suspend fun pause() {

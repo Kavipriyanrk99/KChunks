@@ -1,4 +1,4 @@
-package io.github.kavipriyanrk99.kchunks
+package io.github.kavipriyanrk99.kchunks.service
 
 import okio.FileSystem
 import okio.Path

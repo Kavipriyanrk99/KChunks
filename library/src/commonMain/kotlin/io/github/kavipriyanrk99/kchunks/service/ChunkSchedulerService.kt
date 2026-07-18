@@ -2,16 +2,23 @@ package io.github.kavipriyanrk99.kchunks.service
 
 import io.github.kavipriyanrk99.kchunks.Chunk
 import io.github.kavipriyanrk99.kchunks.DownloadState
+import io.github.kavipriyanrk99.kchunks.EpochMetrics
 import io.github.kavipriyanrk99.kchunks.KChunksDefaults
-import io.github.kavipriyanrk99.kchunks.utils.HttpUtils
-import io.ktor.http.Headers
+import io.github.kavipriyanrk99.kchunks.utils.AdjustableSemaphore
+import io.ktor.http.*
+import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlin.coroutines.cancellation.CancellationException
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.time.Duration.Companion.nanoseconds
 import kotlin.time.Duration.Companion.seconds
 
 class ChunkSchedulerService(
@@ -20,45 +27,40 @@ class ChunkSchedulerService(
     private val chunks: StateFlow<Map<String, Chunk>>,
     val updateChunkStateFlow: (chunkName: String, transform: Chunk.() -> Chunk) -> Unit
 ) {
+    private companion object {
+        const val MIN_LIMIT = KChunksDefaults.CONCURRENCY_LIMIT_MIN_LIMIT
+        const val INITIAL_LIMIT = KChunksDefaults.CONCURRENCY_LIMIT_INITIAL_LIMIT
+        const val MAX_LIMIT = KChunksDefaults.CONCURRENCY_LIMIT_MAX_LIMIT
+        const val BACKOFF_RATIO = KChunksDefaults.CONCURRENCY_LIMIT_BACKOFF_RATIO
+        const val TIMEOUT = KChunksDefaults.CONCURRENCY_LIMIT_DEFAULT_TIMEOUT_NS
+        const val EPOCH_INTERVAL = KChunksDefaults.CONCURRENCY_LIMIT_EPOCH_INTERVAL_NS
+    }
 
-    suspend fun schedule(initialWorkers: Int = KChunksDefaults.DEFAULT_WORKERS) = coroutineScope {
-        var currentWorkers = initialWorkers
-        var optimalWorkers = initialWorkers
-        launchWorkers(currentWorkers)
+    private val epochMetrics = EpochMetrics()
+    private val mutex = Mutex()
+    private val semaphore = AdjustableSemaphore()
+
+    suspend fun schedule(initialWorkers: Int = INITIAL_LIMIT) = coroutineScope {
+        require(initialWorkers <= MAX_LIMIT) { "Initial concurrent limit $initialWorkers exceeded maximum concurrent limit $MAX_LIMIT" }
+        require(initialWorkers >= MIN_LIMIT) { "Initial concurrent limit $initialWorkers is less than minimum concurrent limit $MIN_LIMIT" }
 
         launch {
-            // waits till chunks in downloadState goes to DownloadState.Download
-            awaitChunksInDownloading(currentWorkers)
-            var prevThroughput = HttpUtils.calculateCurrentThroughput(chunks.value.values.toList())
-            var currentThroughput: Double
-            while (chunkQueue.isNotEmpty()) {
-                delay(10.seconds)
-
-                currentWorkers = calculateCurrentWorkers()
-                if (currentWorkers != 0)
-                    optimalWorkers = currentWorkers
-
-                currentThroughput = HttpUtils.calculateCurrentThroughput(chunks.value.values.toList())
-                if (currentWorkers == 0)
-                    launchWorkers(optimalWorkers)
-                else {
-                    if ((currentThroughput - prevThroughput) / prevThroughput >= 0.05) {
-                        launchWorkers()
-                        currentWorkers += 1
-                    } else {
-                        currentWorkers /= 2
-                        killSlowWorkers(currentWorkers)
-                    }
-                }
-
-                prevThroughput = currentThroughput
-                IOUtils.log("Optimal workers: $optimalWorkers, current workers: $currentWorkers")
+            var currentWorkersLimit = initialWorkers
+            while (areAllChunksDownloaded.not()) {
+                semaphore.setPermits(currentWorkersLimit)
+                launchWorkers(chunkQueue.size)
+                delay(EPOCH_INTERVAL.nanoseconds)
+                val inflightWorkers = calculateInflightWorkers()
+                val metrics = epochMetrics.snapshotAndReset()
+                val newWorkersLimit =
+                    getAIMDConcurrencyLimit(currentWorkersLimit, inflightWorkers, metrics.avgLatencyNs, metrics.didDrop)
+                currentWorkersLimit = newWorkersLimit
             }
         }
     }
 
-    private fun CoroutineScope.launchWorkers(count: Int = 1) = repeat(count) {
-        val chunk = chunkQueue.removeFirstOrNull()
+    private suspend fun CoroutineScope.launchWorkers(count: Int = 1) = repeat(count) {
+        val chunk = mutex.withLock { chunkQueue.removeFirstOrNull() }
         chunk?.let { chunk ->
             val customHeaders = Headers.build {
                 val range = "bytes=${chunk.currentOffset}-${chunk.endByte}"
@@ -67,76 +69,64 @@ class ChunkSchedulerService(
                 append("Range", range)
             }
 
-            val job = launch {
+            val job = launch(CoroutineName("#${chunk.name}-coroutine")) {
                 with(HttpService) {
-                    try {
-                        streamingDownload(
-                            url = url,
-                            chunkName = chunk.name,
-                            chunkFilePath = chunk.filePath,
-                            customHeaders = customHeaders,
-                            updateChunkStateFlow = updateChunkStateFlow
-                        )
-                    } catch (ce: CancellationException) {
-                        throw CancellationException(ce)
-                    } catch (e: Exception) {
-                        // add chunk again to the queue on failure
-                        chunkQueue.addLast(chunk)
-                        throw Exception(e)
+                    semaphore.withPermit {
+                        try {
+                            streamingDownload(
+                                url = url,
+                                chunkName = chunk.name,
+                                chunkFilePath = chunk.filePath,
+                                epochMetrics = epochMetrics,
+                                customHeaders = customHeaders,
+                                updateChunkStateFlow = updateChunkStateFlow
+                            )
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (e: Exception) {
+                            // add chunk again to the queue on failure
+                            mutex.withLock { chunkQueue.addLast(chunk) }
+                            updateChunkStateFlow(chunk.name) {
+                                copy(state = DownloadState.Failed)
+                            }
+                            epochMetrics.record(0.seconds, false)
+                            throw e
+                        }
                     }
+                }
 
+                updateChunkStateFlow(chunk.name) {
+                    copy(state = DownloadState.Done)
                 }
             }
 
-//            chunks.update { oldChunks ->
-//                oldChunks + (chunk.name to oldChunks[chunk.name]!!.copy(
-//                    job = job,
-//                    state = DownloadState.Started
-//                ))
-//            }
             updateChunkStateFlow(chunk.name) {
                 copy(job = job, state = DownloadState.Started)
             }
         }
     }
 
-    private fun killSlowWorkers(count: Int) = repeat(count) {
-        val slowState = chunks.value
+    private val areAllChunksDownloaded
+        get() = chunks.value
             .values
-            .filter { it.state is DownloadState.Downloading }
-            .minByOrNull {
-                it.speed ?: 0.0
-            }
+            .all { it.state is DownloadState.Done }
 
-        slowState?.let { slowState ->
-            slowState.job?.cancel()
-        }
-//        val slowState = _downloadStateMultipart.value.minByOrNull {
-//            (it.value as? DownloadState.Downloading)?.percentage ?: 0.0
-//        }
-//
-//        if (slowState != null) {
-//            val coroutineName = jobCoroutineNameMap[slowState.key]
-//            slowState.key.cancel()
-//            _downloadStateMultipart.update { old ->
-//                old.toMutableMap().apply {
-//                    remove(slowState.key)
-//                }
-//            }
-//            tempChunks.remove(coroutineName)?.let {
-//                chunks[coroutineName!!] = it
-//            }
-//            IOUtils.log("Killing worker of chunk: $coroutineName")
-//        }
-    }
-
-    private suspend fun awaitChunksInDownloading(currentWorkers: Int) = chunks
-        .first { map ->
-            map.isNotEmpty() && map.filter { it.value.state is DownloadState.Downloading }.size == currentWorkers
-        }
-
-    private fun calculateCurrentWorkers() = chunks.value
+    private fun calculateInflightWorkers() = chunks.value
         .values
         .filter { it.state is DownloadState.Downloading }
         .size
+
+    private fun getAIMDConcurrencyLimit(currentLimit: Int, inflight: Int, latency: Long, didDrop: Boolean): Int {
+        var newLimit = currentLimit
+        if (didDrop || latency > TIMEOUT) {
+            newLimit = (currentLimit * BACKOFF_RATIO).toInt()
+        } else if (inflight * 2 >= currentLimit) {
+            newLimit = currentLimit + 1;
+        }
+
+        return min(
+            MAX_LIMIT,
+            max(MIN_LIMIT, newLimit)
+        )
+    }
 }

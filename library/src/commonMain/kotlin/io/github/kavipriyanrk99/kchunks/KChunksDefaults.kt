@@ -20,4 +20,10 @@ internal object KChunksDefaults {
     const val DEFAULT_CHUNK_SIZE = 1024 * 1024 * 2L // 2 MebiBytes
     const val DEFAULT_BUFFER_SIZE = 1024 * 16L // 16 KibiBytes
     const val DEFAULT_SAMPLE_SIZE = 10
+    const val CONCURRENCY_LIMIT_DEFAULT_TIMEOUT_NS = 5_00_00_00_000 // 5 seconds
+    const val CONCURRENCY_LIMIT_MIN_LIMIT = 2
+    const val CONCURRENCY_LIMIT_INITIAL_LIMIT = 2
+    const val CONCURRENCY_LIMIT_MAX_LIMIT = 32
+    const val CONCURRENCY_LIMIT_BACKOFF_RATIO = 0.9
+    const val CONCURRENCY_LIMIT_EPOCH_INTERVAL_NS = 3_00_00_00_000 // 3 seconds
 }

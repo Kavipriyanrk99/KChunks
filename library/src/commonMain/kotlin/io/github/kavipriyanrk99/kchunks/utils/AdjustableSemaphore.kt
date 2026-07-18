@@ -5,7 +5,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
-internal class AdjustableSemaphore(initialPermits: Int) {
+internal class AdjustableSemaphore(initialPermits: Int = 0) {
     init {
         require(initialPermits >= 0) { "Permits can't be negative" }
     }

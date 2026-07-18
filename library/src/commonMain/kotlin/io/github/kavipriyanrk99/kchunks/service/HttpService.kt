@@ -6,6 +6,7 @@ import DownloadSample
 import IOUtils
 import io.github.kavipriyanrk99.kchunks.Chunk
 import io.github.kavipriyanrk99.kchunks.DownloadState
+import io.github.kavipriyanrk99.kchunks.EpochMetrics
 import io.github.kavipriyanrk99.kchunks.KChunksDefaults
 import io.ktor.client.call.*
 import io.ktor.client.request.*
@@ -14,8 +15,6 @@ import io.ktor.http.*
 import io.ktor.utils.io.*
 import io.ktor.utils.io.core.*
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.update
 import kotlinx.io.Source
 import kotlinx.io.buffered
 import kotlinx.io.readByteArray
@@ -23,6 +22,7 @@ import okio.FileSystem
 import okio.Path
 import okio.SYSTEM
 import kotlin.coroutines.cancellation.CancellationException
+import kotlin.time.Duration
 import kotlin.time.measureTime
 
 internal object HttpService {
@@ -42,6 +42,7 @@ internal object HttpService {
         url: String,
         chunkName: String,
         chunkFilePath: Path,
+        epochMetrics: EpochMetrics,
         customHeaders: Headers = Headers.Empty,
         bufferSize: Long = KChunksDefaults.DEFAULT_BUFFER_SIZE,
         updateChunkStateFlow: (chunkName: String, transform: Chunk.() -> Chunk) -> Unit
@@ -83,12 +84,15 @@ internal object HttpService {
                 FileSystem.SYSTEM.write(chunkFilePath) {
                     while (!channel.exhausted()) {
                         lateinit var chunk: Source
+                        var chunkReadLatency: Duration
                         val duration = measureTime {
-                            chunk = channel.readRemaining(bufferSize)
+                            chunkReadLatency = measureTime { chunk = channel.readRemaining(bufferSize) }
                             prevReadBytes = readBytes
                             readBytes += chunk.remaining
                             this.write(chunk.buffered().readByteArray())
                         }
+
+                        epochMetrics.record(chunkReadLatency)
 
                         if (chunkDownloadSample.size == KChunksDefaults.DEFAULT_SAMPLE_SIZE) {
                             chunkDownloadSample.removeFirst()

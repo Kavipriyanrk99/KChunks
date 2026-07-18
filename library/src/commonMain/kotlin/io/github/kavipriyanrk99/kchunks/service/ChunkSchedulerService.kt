@@ -1,6 +1,7 @@
 package io.github.kavipriyanrk99.kchunks.service
 
 import io.github.kavipriyanrk99.kchunks.Chunk
+import io.github.kavipriyanrk99.kchunks.DefaultEpochMetrics
 import io.github.kavipriyanrk99.kchunks.DownloadState
 import io.github.kavipriyanrk99.kchunks.EpochMetrics
 import io.github.kavipriyanrk99.kchunks.KChunksDefaults
@@ -36,7 +37,7 @@ class ChunkSchedulerService(
         const val EPOCH_INTERVAL = KChunksDefaults.CONCURRENCY_LIMIT_EPOCH_INTERVAL_NS
     }
 
-    private val epochMetrics = EpochMetrics()
+    private val epochMetrics = DefaultEpochMetrics()
     private val mutex = Mutex()
     private val semaphore = AdjustableSemaphore()
 
@@ -78,6 +79,7 @@ class ChunkSchedulerService(
                                 chunkName = chunk.name,
                                 chunkFilePath = chunk.filePath,
                                 epochMetrics = epochMetrics,
+                                rangeRequest = true,
                                 customHeaders = customHeaders,
                                 updateChunkStateFlow = updateChunkStateFlow
                             )
@@ -109,7 +111,7 @@ class ChunkSchedulerService(
     private val areAllChunksDownloaded
         get() = chunks.value
             .values
-            .all { it.state is DownloadState.Done }
+            .run { isNotEmpty() && all { it.state is DownloadState.Done } }
 
     private fun calculateInflightWorkers() = chunks.value
         .values

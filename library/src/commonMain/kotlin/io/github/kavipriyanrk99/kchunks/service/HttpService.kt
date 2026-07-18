@@ -5,9 +5,11 @@ import DataUtils
 import DownloadSample
 import IOUtils
 import io.github.kavipriyanrk99.kchunks.Chunk
+import io.github.kavipriyanrk99.kchunks.DefaultEpochMetrics
 import io.github.kavipriyanrk99.kchunks.DownloadState
 import io.github.kavipriyanrk99.kchunks.EpochMetrics
 import io.github.kavipriyanrk99.kchunks.KChunksDefaults
+import io.github.kavipriyanrk99.kchunks.NoOpEpochMetrics
 import io.ktor.client.call.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
@@ -42,13 +44,12 @@ internal object HttpService {
         url: String,
         chunkName: String,
         chunkFilePath: Path,
-        epochMetrics: EpochMetrics,
+        epochMetrics: EpochMetrics = NoOpEpochMetrics,
+        rangeRequest: Boolean = false,
         customHeaders: Headers = Headers.Empty,
         bufferSize: Long = KChunksDefaults.DEFAULT_BUFFER_SIZE,
         updateChunkStateFlow: (chunkName: String, transform: Chunk.() -> Chunk) -> Unit
     ) {
-//        val chunkCoroutineJob = coroutineContext[Job]
-//        val chunkCoroutineName = jobCoroutineNameMap[chunkCoroutineJob]
         IOUtils.log(coroutineContext, "streamingDownloadMultipart started for chunk: $chunkName")
 
         try {
@@ -56,31 +57,26 @@ internal object HttpService {
                 if (customHeaders !== Headers.Empty)
                     this.headers.appendAll(customHeaders)
             }.execute { response ->
-                if (response.isSuccessful().not() || response.status != HttpStatusCode.PartialContent) {
+                if (response.isSuccessful().not()) {
+                    IOUtils.log(coroutineContext, "Request failed with status code: ${response.status.value}, msg: ${response.status.description}")
+                    error("Request failed with status code: ${response.status.value}, msg: ${response.status.description}")
+                }
+
+                if(rangeRequest && response.status != HttpStatusCode.PartialContent) {
                     IOUtils.log(coroutineContext, "Range-request failed chunk: $chunkName")
                     error("Range-request failed")
                 }
 
-//                val chunkFileName = "${this@KChunks.fileName}.${chunkCoroutineName}"
                 val chunkContentLength = response.headers["Content-Length"]?.toLongOrNull()?.bytes
                 val chunkDownloadSample = ArrayDeque<DownloadSample>()
-
-//                _downloadStateMultipart.update { old ->
-//                    old.toMutableMap().apply {
-//                        this[chunkCoroutineJob!!] = DownloadState.Started
-//                    }
-//                }
-//                _chunks.update { oldChunks ->
-//                    oldChunks + (chunkName to oldChunks[chunkName]!!.copy(state = DownloadState.Downloading))
-//                }
-                updateChunkStateFlow(chunkName) {
-                    copy(state = DownloadState.Downloading)
-                }
                 val channel: ByteReadChannel = response.body()
                 var readBytes = 0L
                 var prevReadBytes = 0L
 
-//                val chunkFilePath = path.resolve(chunkFileName)
+                updateChunkStateFlow(chunkName) {
+                    copy(state = DownloadState.Downloading)
+                }
+
                 FileSystem.SYSTEM.write(chunkFilePath) {
                     while (!channel.exhausted()) {
                         lateinit var chunk: Source
@@ -92,7 +88,8 @@ internal object HttpService {
                             this.write(chunk.buffered().readByteArray())
                         }
 
-                        epochMetrics.record(chunkReadLatency)
+                        if(epochMetrics is DefaultEpochMetrics)
+                            epochMetrics.record(chunkReadLatency)
 
                         if (chunkDownloadSample.size == KChunksDefaults.DEFAULT_SAMPLE_SIZE) {
                             chunkDownloadSample.removeFirst()
@@ -105,22 +102,6 @@ internal object HttpService {
                         val downloadPercentage = if (chunkContentLength == null) Double.NaN
                         else DataUtils.calculateDownloadPercentage(chunkContentLength, readBytes.bytes)
 
-//                        _downloadStateMultipart.update { old ->
-//                            old.toMutableMap().apply {
-//                                this[chunkCoroutineJob!!] = DownloadState.Downloading(
-//                                    speed = downloadSpeed,
-//                                    eta = downloadETA,
-//                                    percentage = downloadPercentage
-//                                )
-//                            }
-//                        }
-//                        _chunks.update { oldChunks ->
-//                            oldChunks + (chunkName to oldChunks[chunkName]!!.copy(
-//                                speed = downloadSpeed,
-//                                eta = downloadETA,
-//                                percentage = downloadPercentage
-//                            ))
-//                        }
                         updateChunkStateFlow(chunkName) {
                             copy(
                                 speed = downloadSpeed,
@@ -141,16 +122,7 @@ internal object HttpService {
             throw ce
         } catch (e: Exception) {
             IOUtils.log(coroutineContext, e)
-//            tempChunks.remove(chunkCoroutineName)?.let {
-//                chunks[chunkCoroutineName!!] = it
-//            }
             throw e
-        } finally {
-//            _downloadStateMultipart.update { old ->
-//                old.toMutableMap().apply {
-//                    remove(chunkCoroutineJob)
-//                }
-//            }
         }
     }
 }

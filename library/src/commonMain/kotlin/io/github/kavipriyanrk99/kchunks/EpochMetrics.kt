@@ -37,6 +37,11 @@ class DefaultEpochMetrics: EpochMetrics {
             IOUtils.log("Zero samples. Returning empty metrics")
             return EpochMetrics.Metrics(0, false)
         }
+
+        if(totalSample == totalFailures) {
+            IOUtils.log("All samples failed. Returning drop metrics")
+            return EpochMetrics.Metrics(0, true)
+        }
         val avgLatencyNs = totalLatencyNs / (totalSample - totalFailures)
         val didDrop = totalFailures > 0
 

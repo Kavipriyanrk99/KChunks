@@ -6,5 +6,6 @@ sealed interface DownloadState {
     object Paused: DownloadState
     object Done: DownloadState
     object Failed: DownloadState
+    object Retry: DownloadState
     object Unknown: DownloadState
 }

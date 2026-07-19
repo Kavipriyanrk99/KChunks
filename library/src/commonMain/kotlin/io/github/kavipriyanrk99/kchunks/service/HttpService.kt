@@ -4,14 +4,7 @@ import DataSize.Companion.bytes
 import DataUtils
 import DownloadSample
 import IOUtils
-import io.github.kavipriyanrk99.kchunks.Chunk
-import io.github.kavipriyanrk99.kchunks.DefaultEpochMetrics
-import io.github.kavipriyanrk99.kchunks.DownloadState
-import io.github.kavipriyanrk99.kchunks.EpochMetrics
-import io.github.kavipriyanrk99.kchunks.KChunksDefaults
-import io.github.kavipriyanrk99.kchunks.NoOpEpochMetrics
-import io.github.kavipriyanrk99.kchunks.NonRetryableNetworkException
-import io.github.kavipriyanrk99.kchunks.RetryableNetworkException
+import io.github.kavipriyanrk99.kchunks.*
 import io.ktor.client.call.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
@@ -51,15 +44,15 @@ internal object HttpService {
     }
 
     private fun HttpResponse.validate(customHeaders: Headers, rangeRequest: Boolean = false): Unit = when {
-        rangeRequest && this.status != HttpStatusCode.PartialContent ->
+        rangeRequest && isSuccessful() && this.status != HttpStatusCode.PartialContent ->
             throw NonRetryableNetworkException("Range request failed with status code: ${this.status.value}, msg: ${this.status.description}")
 
         isSuccessful() -> return
 
         this.status.value in RETRYABLE_CODES ->
             throw RetryableNetworkException(
-                "Request failed with status code: ${this.status.value}, msg: ${this.status.description}",
-                retryAfter = headers["Retry-After"]
+                retryAfter = headers["Retry-After"],
+                "Request failed with status code: ${this.status.value}, msg: ${this.status.description}"
             )
 
         this.status == HttpStatusCode.PreconditionFailed ->

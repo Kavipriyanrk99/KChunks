@@ -1,19 +1,15 @@
 package io.github.kavipriyanrk99.kchunks.service
 
-import io.github.kavipriyanrk99.kchunks.Chunk
-import io.github.kavipriyanrk99.kchunks.DefaultEpochMetrics
-import io.github.kavipriyanrk99.kchunks.DownloadState
-import io.github.kavipriyanrk99.kchunks.EpochMetrics
-import io.github.kavipriyanrk99.kchunks.KChunksDefaults
+import IOUtils
+import io.github.kavipriyanrk99.kchunks.*
+import io.github.kavipriyanrk99.kchunks.Downloader.Companion.anyChunkInDownloadingState
+import io.github.kavipriyanrk99.kchunks.Downloader.Companion.anyChunkInRetryState
+import io.github.kavipriyanrk99.kchunks.Downloader.Companion.anyChunkInStartedState
+import io.github.kavipriyanrk99.kchunks.Downloader.Companion.anyChunkInUnknownState
 import io.github.kavipriyanrk99.kchunks.utils.AdjustableSemaphore
 import io.ktor.http.*
-import kotlinx.coroutines.CoroutineName
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlin.coroutines.cancellation.CancellationException
@@ -47,7 +43,7 @@ class ChunkSchedulerService(
 
         launch {
             var currentWorkersLimit = initialWorkers
-            while (areAllChunksDownloaded.not()) {
+            while (chunks.run { anyChunkInStartedState || anyChunkInDownloadingState || anyChunkInRetryState || anyChunkInUnknownState }) {
                 semaphore.setPermits(currentWorkersLimit)
                 launchWorkers(chunkQueue.size)
                 delay(EPOCH_INTERVAL.nanoseconds)
@@ -56,6 +52,7 @@ class ChunkSchedulerService(
                 val newWorkersLimit =
                     getAIMDConcurrencyLimit(currentWorkersLimit, inflightWorkers, metrics.avgLatencyNs, metrics.didDrop)
                 currentWorkersLimit = newWorkersLimit
+                IOUtils.log("currentWorkersLimit: $currentWorkersLimit, inflight: $inflightWorkers, queueSize: ${chunkQueue.size}")
             }
         }
     }
@@ -86,19 +83,39 @@ class ChunkSchedulerService(
                         } catch (ce: CancellationException) {
                             throw ce
                         } catch (e: Exception) {
-                            // add chunk again to the queue on failure
-                            mutex.withLock { chunkQueue.addLast(chunk) }
-                            updateChunkStateFlow(chunk.name) {
-                                copy(state = DownloadState.Failed)
+                            when(e) {
+                                is RetryableNetworkException -> {
+                                    // add chunk again to the queue on failure
+                                    mutex.withLock { chunkQueue.addLast(chunk) }
+                                    epochMetrics.record(0.seconds, false)
+                                    updateChunkStateFlow(chunk.name) {
+                                        copy(state = DownloadState.Retry)
+                                    }
+                                    IOUtils.log(
+                                        coroutineContext,
+                                        "Streaming download failed with ${e.message}, added to queue again for retry after: ${e.retryAfter}"
+                                    )
+
+                                    return@withPermit
+                                }
+
+                                else -> {
+                                    updateChunkStateFlow(chunk.name) {
+                                        copy(state = DownloadState.Failed)
+                                    }
+                                    IOUtils.log(
+                                        coroutineContext,
+                                        "Streaming download failed with ${e.message}"
+                                    )
+                                    throw e
+                                }
                             }
-                            epochMetrics.record(0.seconds, false)
-                            throw e
+                        }
+
+                        updateChunkStateFlow(chunk.name) {
+                            copy(state = DownloadState.Done)
                         }
                     }
-                }
-
-                updateChunkStateFlow(chunk.name) {
-                    copy(state = DownloadState.Done)
                 }
             }
 
@@ -107,11 +124,6 @@ class ChunkSchedulerService(
             }
         }
     }
-
-    private val areAllChunksDownloaded
-        get() = chunks.value
-            .values
-            .run { isNotEmpty() && all { it.state is DownloadState.Done } }
 
     private fun calculateInflightWorkers() = chunks.value
         .values

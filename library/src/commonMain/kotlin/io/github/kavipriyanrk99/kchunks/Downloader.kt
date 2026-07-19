@@ -3,20 +3,19 @@ package io.github.kavipriyanrk99.kchunks
 import io.github.kavipriyanrk99.kchunks.service.ChunkSchedulerService
 import io.github.kavipriyanrk99.kchunks.service.HttpService
 import io.github.kavipriyanrk99.kchunks.utils.HttpUtils
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.withContext
 import okio.Path
 import kotlin.math.ceil
 import kotlin.time.Clock
 
 
 class Downloader(private val url: String, private val dirPath: Path) {
-    private val coroutineScope by lazy { CoroutineScope(Dispatchers.IO) }
-
     // header properties
     private var contentLength: Long? = null
     private var contentDisposition: String? = null
@@ -29,8 +28,35 @@ class Downloader(private val url: String, private val dirPath: Path) {
     private val _chunks = MutableStateFlow<Map<String, Chunk>>(emptyMap())
     val chunks = _chunks.asStateFlow()
 
+    companion object {
+        val StateFlow<Map<String, Chunk>>.anyChunkInStartedState
+            get() = this.value
+                .values
+                .run { isNotEmpty() && any { it.state is DownloadState.Started } }
 
-    suspend fun multipartDownload() = with(coroutineScope) {
+        val StateFlow<Map<String, Chunk>>.anyChunkInDownloadingState
+            get() = this.value
+                .values
+                .run { isNotEmpty() && any { it.state is DownloadState.Downloading } }
+
+        val StateFlow<Map<String, Chunk>>.anyChunkInRetryState
+            get() = this.value
+                .values
+                .run { isNotEmpty() && any { it.state is DownloadState.Retry } }
+
+        val StateFlow<Map<String, Chunk>>.anyChunkInUnknownState
+            get() = this.value
+                .values
+                .run { isNotEmpty() && any { it.state is DownloadState.Unknown } }
+
+        val StateFlow<Map<String, Chunk>>.areAllChunksDownloaded
+            get() = this.value
+                .values
+                .run { isNotEmpty() && all { it.state is DownloadState.Done } }
+    }
+
+
+    suspend fun multipartDownload() = withContext(Dispatchers.IO) {
         initializeHeaderBasedProperties()
         require(allowRangeRequests) { "Server doesn't support range-request. Multi-part downloading is not possible" }
         checkNotNull(contentLength) { "Multi-part download requires Content-Length" }

@@ -10,6 +10,8 @@ import io.github.kavipriyanrk99.kchunks.DownloadState
 import io.github.kavipriyanrk99.kchunks.EpochMetrics
 import io.github.kavipriyanrk99.kchunks.KChunksDefaults
 import io.github.kavipriyanrk99.kchunks.NoOpEpochMetrics
+import io.github.kavipriyanrk99.kchunks.NonRetryableNetworkException
+import io.github.kavipriyanrk99.kchunks.RetryableNetworkException
 import io.ktor.client.call.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
@@ -28,12 +30,45 @@ import kotlin.time.Duration
 import kotlin.time.measureTime
 
 internal object HttpService {
+    private val RETRYABLE_CODES = setOf(
+        408,
+        421,
+        425,
+        429,
+        500,
+        502,
+        503,
+        504,
+        507
+    )
+
     private fun HttpResponse.isSuccessful() = when {
         this.status.isSuccess() -> true
         else -> {
             println("Request failed with status code: ${this.status.value}, msg: ${this.status.description}")
             false
         }
+    }
+
+    private fun HttpResponse.validate(customHeaders: Headers, rangeRequest: Boolean = false): Unit = when {
+        rangeRequest && this.status != HttpStatusCode.PartialContent ->
+            throw NonRetryableNetworkException("Range request failed with status code: ${this.status.value}, msg: ${this.status.description}")
+
+        isSuccessful() -> return
+
+        this.status.value in RETRYABLE_CODES ->
+            throw RetryableNetworkException(
+                "Request failed with status code: ${this.status.value}, msg: ${this.status.description}",
+                retryAfter = headers["Retry-After"]
+            )
+
+        this.status == HttpStatusCode.PreconditionFailed ->
+            throw NonRetryableNetworkException("Conditional request failed with status code: ${this.status.value}, msg: ${this.status.description}")
+
+        status == HttpStatusCode.RequestedRangeNotSatisfiable ->
+            throw NonRetryableNetworkException("Invalid Range header: ${customHeaders["Range"]}. Request failed with status code: ${this.status.value}, msg: ${this.status.description}")
+
+        else -> throw NonRetryableNetworkException("Request failed with status code: ${this.status.value}, msg: ${this.status.description}")
     }
 
     suspend fun getHeaders(url: String) = KChunksDefaults.defaultHttpClient.prepareGet(url).execute {
@@ -57,15 +92,7 @@ internal object HttpService {
                 if (customHeaders !== Headers.Empty)
                     this.headers.appendAll(customHeaders)
             }.execute { response ->
-                if (response.isSuccessful().not()) {
-                    IOUtils.log(coroutineContext, "Request failed with status code: ${response.status.value}, msg: ${response.status.description}")
-                    error("Request failed with status code: ${response.status.value}, msg: ${response.status.description}")
-                }
-
-                if(rangeRequest && response.status != HttpStatusCode.PartialContent) {
-                    IOUtils.log(coroutineContext, "Range-request failed chunk: $chunkName")
-                    error("Range-request failed")
-                }
+                response.validate(customHeaders, rangeRequest)
 
                 val chunkContentLength = response.headers["Content-Length"]?.toLongOrNull()?.bytes
                 val chunkDownloadSample = ArrayDeque<DownloadSample>()
@@ -88,7 +115,7 @@ internal object HttpService {
                             this.write(chunk.buffered().readByteArray())
                         }
 
-                        if(epochMetrics is DefaultEpochMetrics)
+                        if (epochMetrics is DefaultEpochMetrics)
                             epochMetrics.record(chunkReadLatency)
 
                         if (chunkDownloadSample.size == KChunksDefaults.DEFAULT_SAMPLE_SIZE) {
@@ -118,10 +145,8 @@ internal object HttpService {
                 }
             }
         } catch (ce: CancellationException) {
-            IOUtils.log(coroutineContext, ce)
             throw ce
         } catch (e: Exception) {
-            IOUtils.log(coroutineContext, e)
             throw e
         }
     }

@@ -70,15 +70,15 @@ internal object HttpService {
 
     suspend fun CoroutineScope.streamingDownload(
         url: String,
-        chunkName: String,
+        chunkId: Int,
         chunkFilePath: Path,
         epochMetrics: EpochMetrics = NoOpEpochMetrics,
         rangeRequest: Boolean = false,
         customHeaders: Headers = Headers.Empty,
         bufferSize: Long = KChunksDefaults.DEFAULT_BUFFER_SIZE,
-        updateChunkStateFlow: (chunkName: String, transform: Chunk.() -> Chunk) -> Unit
+        updateChunkStateFlow: (chunkId: Int, transform: Chunk.() -> Chunk) -> Unit
     ) {
-        IOUtils.log(coroutineContext, "streamingDownloadMultipart started for chunk: $chunkName")
+        IOUtils.log(coroutineContext, "streamingDownloadMultipart started for chunk: $chunkId")
 
         try {
             KChunksDefaults.defaultHttpClient.prepareGet(url) {
@@ -93,7 +93,7 @@ internal object HttpService {
                 var readBytes = 0L
                 var prevReadBytes = 0L
 
-                updateChunkStateFlow(chunkName) {
+                updateChunkStateFlow(chunkId) {
                     copy(state = DownloadState.Downloading)
                 }
 
@@ -122,7 +122,7 @@ internal object HttpService {
                         val downloadPercentage = if (chunkContentLength == null) Double.NaN
                         else DataUtils.calculateDownloadPercentage(chunkContentLength, readBytes.bytes)
 
-                        updateChunkStateFlow(chunkName) {
+                        updateChunkStateFlow(chunkId) {
                             copy(
                                 speed = downloadSpeed,
                                 eta = downloadETA,
@@ -132,7 +132,7 @@ internal object HttpService {
 
                         IOUtils.log(
                             coroutineContext,
-                            "Chunk: $chunkName, Received $readBytes bytes from ${chunkContentLength?.bytes ?: "UNKNOWN"} | Progress: $downloadSpeed bytes/sec, $downloadETA ETA in sec, ${downloadPercentage}%"
+                            "Chunk: $chunkId, Received $readBytes bytes from ${chunkContentLength?.bytes ?: "UNKNOWN"} | Progress: $downloadSpeed bytes/sec, $downloadETA ETA in sec, ${downloadPercentage}%"
                         )
                     }
                 }

@@ -4,7 +4,7 @@ import kotlinx.coroutines.Job
 import okio.Path
 
 data class Chunk(
-    val name: String,
+    val id: Int,
     val startByte: Long,
     val endByte: Long,
     val currentOffset: Long,

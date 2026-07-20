@@ -21,8 +21,8 @@ import kotlin.time.Duration.Companion.seconds
 class ChunkSchedulerService(
     private val url: String,
     private val chunkQueue: ArrayDeque<Chunk>,
-    private val chunks: StateFlow<Map<String, Chunk>>,
-    val updateChunkStateFlow: (chunkName: String, transform: Chunk.() -> Chunk) -> Unit
+    private val chunks: StateFlow<Map<Int, Chunk>>,
+    val updateChunkStateFlow: (chunkId: Int, transform: Chunk.() -> Chunk) -> Unit
 ) {
     private companion object {
         const val MIN_LIMIT = KChunksDefaults.CONCURRENCY_LIMIT_MIN_LIMIT
@@ -67,13 +67,13 @@ class ChunkSchedulerService(
                 append("Range", range)
             }
 
-            val job = launch(CoroutineName("#${chunk.name}-coroutine")) {
+            val job = launch(CoroutineName("#chunk-${chunk.id}-coroutine")) {
                 with(HttpService) {
                     semaphore.withPermit {
                         try {
                             streamingDownload(
                                 url = url,
-                                chunkName = chunk.name,
+                                chunkId = chunk.id,
                                 chunkFilePath = chunk.filePath,
                                 epochMetrics = epochMetrics,
                                 rangeRequest = true,
@@ -88,7 +88,7 @@ class ChunkSchedulerService(
                                     // add chunk again to the queue on failure
                                     mutex.withLock { chunkQueue.addLast(chunk) }
                                     epochMetrics.record(0.seconds, false)
-                                    updateChunkStateFlow(chunk.name) {
+                                    updateChunkStateFlow(chunk.id) {
                                         copy(state = DownloadState.Retry)
                                     }
                                     IOUtils.log(
@@ -100,26 +100,28 @@ class ChunkSchedulerService(
                                 }
 
                                 else -> {
-                                    updateChunkStateFlow(chunk.name) {
+                                    updateChunkStateFlow(chunk.id) {
                                         copy(state = DownloadState.Failed)
                                     }
                                     IOUtils.log(
                                         coroutineContext,
                                         "Streaming download failed with ${e.message}"
                                     )
-                                    throw e
+
+                                    if(e !is NonRetryableNetworkException)
+                                        throw e
                                 }
                             }
                         }
 
-                        updateChunkStateFlow(chunk.name) {
+                        updateChunkStateFlow(chunk.id) {
                             copy(state = DownloadState.Done)
                         }
                     }
                 }
             }
 
-            updateChunkStateFlow(chunk.name) {
+            updateChunkStateFlow(chunk.id) {
                 copy(job = job, state = DownloadState.Started)
             }
         }

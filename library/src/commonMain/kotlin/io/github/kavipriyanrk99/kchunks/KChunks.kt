@@ -9,8 +9,9 @@ class KChunks(val url: String, val dirPath: Path) {
         require(FileService.validateDirPath(dirPath)) { "Directory path is not a directory" }
     }
 
+    private val downloader = Downloader(url, dirPath)
+
     suspend fun download() {
-        val downloader = Downloader(url, dirPath)
         downloader.multipartDownload()
     }
 
@@ -23,6 +24,7 @@ class KChunks(val url: String, val dirPath: Path) {
     }
 
     suspend fun cancel() {
-        TODO()
+        downloader.cancel()
+        downloader.chunks.value.values.forEach { println("${it.id}:${it.state}") }
     }
 }

@@ -12,7 +12,7 @@ object FileService {
 
     fun combineFiles(targetFileName: String, fileParts: List<Path>) {
         require(targetFileName.isNotBlank()) { "Target filename is empty" }
-        require(fileParts.isNotEmpty()) { "No file parts to combine" }
+        require(fileParts.isNotEmpty()) { "Cannot combine an empty list of file parts." }
 
         val fs = FileSystem.SYSTEM
         val parentDir = fileParts.first().normalized().parent ?: CURRENT_DIRECTORY.toPath()
@@ -36,6 +36,12 @@ object FileService {
         }
 
         fs.atomicMove(tempTargetFilePath, targetFilePath)
+        fileParts.forEach(fs::delete)
+    }
+
+    fun cleanFiles(fileParts: List<Path>) {
+        require(fileParts.isNotEmpty()) { "Cannot clean an empty list of file parts." }
+        val fs = FileSystem.SYSTEM
         fileParts.forEach(fs::delete)
     }
 }

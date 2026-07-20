@@ -37,23 +37,21 @@ class ChunkSchedulerService(
     private val mutex = Mutex()
     private val semaphore = AdjustableSemaphore()
 
-    suspend fun schedule(initialWorkers: Int = INITIAL_LIMIT) = coroutineScope {
+    fun schedule(scope: CoroutineScope, initialWorkers: Int = INITIAL_LIMIT): Job = scope.launch {
         require(initialWorkers <= MAX_LIMIT) { "Initial concurrent limit $initialWorkers exceeded maximum concurrent limit $MAX_LIMIT" }
         require(initialWorkers >= MIN_LIMIT) { "Initial concurrent limit $initialWorkers is less than minimum concurrent limit $MIN_LIMIT" }
 
-        launch {
-            var currentWorkersLimit = initialWorkers
-            while (chunks.run { anyChunkInStartedState || anyChunkInDownloadingState || anyChunkInRetryState || anyChunkInUnknownState }) {
-                semaphore.setPermits(currentWorkersLimit)
-                launchWorkers(chunkQueue.size)
-                delay(EPOCH_INTERVAL.nanoseconds)
-                val inflightWorkers = calculateInflightWorkers()
-                val metrics = epochMetrics.snapshotAndReset()
-                val newWorkersLimit =
-                    getAIMDConcurrencyLimit(currentWorkersLimit, inflightWorkers, metrics.avgLatencyNs, metrics.didDrop)
-                currentWorkersLimit = newWorkersLimit
-                IOUtils.log("currentWorkersLimit: $currentWorkersLimit, inflight: $inflightWorkers, queueSize: ${chunkQueue.size}")
-            }
+        var currentWorkersLimit = initialWorkers
+        while (chunks.run { anyChunkInStartedState || anyChunkInDownloadingState || anyChunkInRetryState || anyChunkInUnknownState }) {
+            semaphore.setPermits(currentWorkersLimit)
+            launchWorkers(chunkQueue.size)
+            delay(EPOCH_INTERVAL.nanoseconds)
+            val inflightWorkers = calculateInflightWorkers()
+            val metrics = epochMetrics.snapshotAndReset()
+            val newWorkersLimit =
+                getAIMDConcurrencyLimit(currentWorkersLimit, inflightWorkers, metrics.avgLatencyNs, metrics.didDrop)
+            currentWorkersLimit = newWorkersLimit
+            IOUtils.log("currentWorkersLimit: $currentWorkersLimit, inflight: $inflightWorkers, queueSize: ${chunkQueue.size}")
         }
     }
 
@@ -68,9 +66,9 @@ class ChunkSchedulerService(
             }
 
             val job = launch(CoroutineName("#chunk-${chunk.id}-coroutine")) {
-                with(HttpService) {
-                    semaphore.withPermit {
-                        try {
+                try {
+                    with(HttpService) {
+                        semaphore.withPermit {
                             streamingDownload(
                                 url = url,
                                 chunkId = chunk.id,
@@ -80,42 +78,48 @@ class ChunkSchedulerService(
                                 customHeaders = customHeaders,
                                 updateChunkStateFlow = updateChunkStateFlow
                             )
-                        } catch (ce: CancellationException) {
-                            throw ce
-                        } catch (e: Exception) {
-                            when(e) {
-                                is RetryableNetworkException -> {
-                                    // add chunk again to the queue on failure
-                                    mutex.withLock { chunkQueue.addLast(chunk) }
-                                    epochMetrics.record(0.seconds, false)
-                                    updateChunkStateFlow(chunk.id) {
-                                        copy(state = DownloadState.Retry)
-                                    }
-                                    IOUtils.log(
-                                        coroutineContext,
-                                        "Streaming download failed with ${e.message}, added to queue again for retry after: ${e.retryAfter}"
-                                    )
+                        }
+                    }
 
-                                    return@withPermit
-                                }
-
-                                else -> {
-                                    updateChunkStateFlow(chunk.id) {
-                                        copy(state = DownloadState.Failed)
-                                    }
-                                    IOUtils.log(
-                                        coroutineContext,
-                                        "Streaming download failed with ${e.message}"
-                                    )
-
-                                    if(e !is NonRetryableNetworkException)
-                                        throw e
-                                }
+                    updateChunkStateFlow(chunk.id) {
+                        copy(state = DownloadState.Done)
+                    }
+                } catch (e: Exception) {
+                    when (e) {
+                        is CancellationException -> {
+                            updateChunkStateFlow(chunk.id) {
+                                copy(state = DownloadState.Cancelled)
                             }
+
+                            throw e
                         }
 
-                        updateChunkStateFlow(chunk.id) {
-                            copy(state = DownloadState.Done)
+                        is RetryableNetworkException -> {
+                            // add chunk again to the queue on failure
+                            mutex.withLock { chunkQueue.addLast(chunk) }
+                            epochMetrics.record(0.seconds, false)
+                            updateChunkStateFlow(chunk.id) {
+                                copy(state = DownloadState.Retry)
+                            }
+                            IOUtils.log(
+                                coroutineContext,
+                                "Streaming download failed with ${e.message}, added to queue again for retry after: ${e.retryAfter}"
+                            )
+
+                            return@launch
+                        }
+
+                        else -> {
+                            updateChunkStateFlow(chunk.id) {
+                                copy(state = DownloadState.Failed)
+                            }
+                            IOUtils.log(
+                                coroutineContext,
+                                "Streaming download failed with ${e.message}"
+                            )
+
+                            if (e !is NonRetryableNetworkException)
+                                throw e
                         }
                     }
                 }

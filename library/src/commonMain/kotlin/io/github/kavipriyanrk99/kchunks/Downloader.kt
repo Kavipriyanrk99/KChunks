@@ -6,6 +6,8 @@ import io.github.kavipriyanrk99.kchunks.service.HttpService
 import io.github.kavipriyanrk99.kchunks.utils.HttpUtils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -28,6 +30,8 @@ class Downloader(private val url: String, private val dirPath: Path) {
 
     private val _chunks = MutableStateFlow<Map<Int, Chunk>>(emptyMap())
     val chunks = _chunks.asStateFlow()
+
+    private var downloadJob: Job? = null
 
     companion object {
         val StateFlow<Map<Int, Chunk>>.anyChunkInStartedState
@@ -62,15 +66,25 @@ class Downloader(private val url: String, private val dirPath: Path) {
         require(allowRangeRequests) { "Server doesn't support range-request. Multi-part downloading is not possible" }
         checkNotNull(contentLength) { "Multi-part download requires Content-Length" }
         _chunks.value = prepareChunks(contentLength!!)
-        val scheduler = ChunkSchedulerService(url,ArrayDeque(chunks.value.values), chunks, updateChunkStateFlow)
-        scheduler.schedule()
-        if(chunks.areAllChunksDownloaded) {
+        val scheduler = ChunkSchedulerService(url, ArrayDeque(chunks.value.values), chunks, updateChunkStateFlow)
+        downloadJob = scheduler.schedule(this)
+        downloadJob!!.join()
+        if (chunks.areAllChunksDownloaded) {
             val sortedFileParts = chunks.value
                 .values
                 .sortedBy { it.id }
                 .map { it.filePath }
             FileService.combineFiles(fileName, sortedFileParts)
         }
+    }
+
+    suspend fun cancel(): Boolean {
+        checkNotNull(downloadJob) { "Download Job was not initialized. No download was started" }
+        return if (downloadJob!!.isActive) {
+            downloadJob!!.cancelAndJoin()
+            FileService.cleanFiles(chunks.value.values.map { it.filePath })
+            true
+        } else false
     }
 
     private suspend fun initializeHeaderBasedProperties() {

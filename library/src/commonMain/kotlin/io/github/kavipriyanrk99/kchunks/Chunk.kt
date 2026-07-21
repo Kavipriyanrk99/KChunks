@@ -1,5 +1,6 @@
 package io.github.kavipriyanrk99.kchunks
 
+import io.github.kavipriyanrk99.kchunks.service.FileService
 import kotlinx.coroutines.Job
 import okio.Path
 
@@ -15,4 +16,17 @@ data class Chunk(
     val eta: Double? = null,
     val percentage: Double = 0.0,
     val filePath: Path
-)
+) {
+    fun computeUpdatedCurrentOffset(): Long {
+        val fileSize = FileService.computeFileSize(filePath)
+        val chunkSize = endByte - startByte + 1
+        check(chunkSize >= fileSize) {
+            "Chunk size: $chunkSize should " +
+                    "be greater than or equal to chunk filesize: $fileSize"
+        }
+
+        return if (chunkSize == fileSize) {
+            endByte
+        } else startByte + fileSize
+    }
+}

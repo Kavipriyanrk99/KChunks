@@ -10,6 +10,13 @@ object FileService {
 
     fun validateDirPath(dirPath: Path): Boolean = FileSystem.SYSTEM.metadata(dirPath).isDirectory
 
+    fun computeFileSize(filePath: Path): Long {
+        val fs = FileSystem.SYSTEM
+        if (!fs.exists(filePath))
+            return 0L
+        return fs.metadata(filePath).size ?: 0L
+    }
+
     fun combineFiles(targetFileName: String, fileParts: List<Path>) {
         require(targetFileName.isNotBlank()) { "Target filename is empty" }
         require(fileParts.isNotEmpty()) { "Cannot combine an empty list of file parts." }
@@ -30,7 +37,7 @@ object FileService {
         fs.write(tempTargetFilePath) {
             fileParts.forEach { part ->
                 fs.read(part) {
-                     readAll(this@write)
+                    readAll(this@write)
                 }
             }
         }

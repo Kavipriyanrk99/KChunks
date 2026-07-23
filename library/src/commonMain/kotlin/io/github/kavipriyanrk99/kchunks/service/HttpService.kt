@@ -18,6 +18,8 @@ import kotlinx.io.readByteArray
 import okio.FileSystem
 import okio.Path
 import okio.SYSTEM
+import okio.buffer
+import okio.use
 import kotlin.coroutines.cancellation.CancellationException
 import kotlin.time.Duration
 import kotlin.time.measureTime
@@ -97,7 +99,7 @@ internal object HttpService {
                     copy(state = DownloadState.Downloading)
                 }
 
-                FileSystem.SYSTEM.write(chunkFilePath) {
+                FileSystem.SYSTEM.appendingSink(chunkFilePath).buffer().use {
                     while (!channel.exhausted()) {
                         lateinit var chunk: Source
                         var chunkReadLatency: Duration
@@ -105,7 +107,7 @@ internal object HttpService {
                             chunkReadLatency = measureTime { chunk = channel.readRemaining(bufferSize) }
                             prevReadBytes = readBytes
                             readBytes += chunk.remaining
-                            this.write(chunk.buffered().readByteArray())
+                            it.write(chunk.buffered().readByteArray())
                         }
 
                         if (epochMetrics is DefaultEpochMetrics)

@@ -58,6 +58,10 @@ class ChunkSchedulerService(
     private suspend fun CoroutineScope.launchWorkers(count: Int = 1) = repeat(count) {
         val chunk = mutex.withLock { chunkQueue.removeFirstOrNull() }
         chunk?.let { chunk ->
+            // prevent re-download during resume
+            if(chunk.state is DownloadState.Done)
+                return@let
+
             val customHeaders = Headers.build {
                 val range = "bytes=${chunk.currentOffset}-${chunk.endByte}"
 

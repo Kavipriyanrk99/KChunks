@@ -15,16 +15,20 @@ class KChunks(val url: String, val dirPath: Path) {
         downloader.multipartDownload()
     }
 
-    suspend fun pause() {
-        TODO()
+    suspend fun pause(): Boolean {
+        val stat = downloader.pause()
+        downloader.chunks.value.values.forEach { println("${it.id}:${it.state}") }
+        return stat
     }
 
     suspend fun resume() {
-        TODO()
+        downloader.resume()
+        downloader.chunks.value.values.forEach { println("${it.id}:${it.state}") }
     }
 
-    suspend fun cancel() {
-        downloader.cancel()
+    suspend fun cancel(): Boolean {
+        val stat = downloader.cancel()
         downloader.chunks.value.values.forEach { println("${it.id}:${it.state}") }
+        return stat
     }
 }

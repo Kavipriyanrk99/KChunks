@@ -66,6 +66,7 @@ class Downloader(private val url: String, private val dirPath: Path) {
         require(allowRangeRequests) { "Server doesn't support range-request. Multi-part downloading is not possible" }
         checkNotNull(contentLength) { "Multi-part download requires Content-Length" }
         _chunks.value = prepareChunks(contentLength!!)
+        FileService.cleanFiles(chunks.value.values.map { it.filePath })
         val scheduler = ChunkSchedulerService(url, ArrayDeque(chunks.value.values), chunks, updateChunkStateFlow)
         downloadJob = scheduler.schedule(this)
         downloadJob!!.join()
@@ -80,11 +81,55 @@ class Downloader(private val url: String, private val dirPath: Path) {
 
     suspend fun cancel(): Boolean {
         checkNotNull(downloadJob) { "Download Job was not initialized. No download was started" }
-        return if (downloadJob!!.isActive) {
-            downloadJob!!.cancelAndJoin()
-            FileService.cleanFiles(chunks.value.values.map { it.filePath })
-            true
-        } else false
+
+        if (downloadJob!!.isCompleted && chunks.areAllChunksDownloaded)
+            return false
+
+        downloadJob!!.cancelAndJoin()
+        FileService.cleanFiles(chunks.value.values.map { it.filePath })
+        return true
+    }
+
+    suspend fun pause(): Boolean {
+        checkNotNull(downloadJob) { "Download Job was not initialized. No download was started" }
+
+        if (downloadJob!!.isCompleted && chunks.areAllChunksDownloaded)
+            return false
+
+        downloadJob!!.cancelAndJoin()
+        return true
+    }
+
+    suspend fun resume() = withContext(Dispatchers.IO) {
+        if (chunks.areAllChunksDownloaded)
+            return@withContext
+
+        if (downloadJob == null || chunks.value.isEmpty()) {
+            initializeHeaderBasedProperties()
+            require(allowRangeRequests) { "Server doesn't support range-request. Multi-part downloading is not possible" }
+            checkNotNull(contentLength) { "Multi-part download requires Content-Length" }
+            _chunks.value = prepareChunks(contentLength!!)
+        }
+
+        chunks.value.values.forEach { chunk ->
+            val newOffset = chunk.computeUpdatedCurrentOffset()
+            updateChunkStateFlow(chunk.id) {
+                copy(
+                    currentOffset = newOffset,
+                    state = if (endByte == newOffset) DownloadState.Done else DownloadState.Unknown
+                )
+            }
+        }
+        val scheduler = ChunkSchedulerService(url, ArrayDeque(chunks.value.values), chunks, updateChunkStateFlow)
+        downloadJob = scheduler.schedule(this)
+        downloadJob!!.join()
+        if (chunks.areAllChunksDownloaded) {
+            val sortedFileParts = chunks.value
+                .values
+                .sortedBy { it.id }
+                .map { it.filePath }
+            FileService.combineFiles(fileName, sortedFileParts)
+        }
     }
 
     private suspend fun initializeHeaderBasedProperties() {

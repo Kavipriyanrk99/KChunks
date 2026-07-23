@@ -9,8 +9,8 @@ internal object KChunksDefaults {
         HttpClient {
             install(HttpTimeout) {
                 requestTimeoutMillis = HttpTimeoutConfig.INFINITE_TIMEOUT_MS
-                connectTimeoutMillis = 10_000
-                socketTimeoutMillis = 30_000
+                connectTimeoutMillis = 10_000 // 10 seconds
+                socketTimeoutMillis = 1_20_000 // 2 minutes
             }
         }
     }
